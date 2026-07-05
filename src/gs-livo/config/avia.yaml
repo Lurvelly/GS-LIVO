@@ -43,6 +43,9 @@ vio:
   inverse_composition_en: false
   exposure_estimate_en: true
   inv_expo_cov: 0.1
+  max_update_rot_deg: 5.0
+  max_update_trans: 0.5
+  max_update_vel: 10.0
 
 imu:
   imu_en: true
@@ -51,6 +54,9 @@ imu:
   gyr_cov: 0.3 # 0.5
   b_acc_cov: 0.0001 # 0.1
   b_gyr_cov: 0.0001 # 0.1
+  max_prop_rot_deg: 20.0
+  max_prop_trans: 3.0
+  max_prop_vel: 30.0
 
 lio:
   max_iterations: 5
@@ -61,6 +67,10 @@ lio:
   max_layer: 2
   max_points_num: 50
   layer_init_num: [5, 5, 5, 5, 5]
+  min_effective_features: 10
+  max_update_rot_deg: 5.0
+  max_update_trans: 1.0
+  max_update_vel: 10.0
 
 local_map:  
   map_sliding_en: false
@@ -93,7 +103,61 @@ pcd_save:
 
 
 gs:
-  gs_iterations: 40
+  voxel_size: 1.0
+  border_gs: 4
+  normal_rejecter: 0.0
+  white_background: false
+  # Saving every rendered/GT image is useful for debugging but too slow for normal odometry.
+  save_results: false
+  save_rendered_images: false
+  save_gt_images: false
+  # Preserve the original FAST-LIVO sparse visual update while GS runs as a
+  # mapping/rendering side path. Disable only when testing pure GS tracking.
+  sparse_vio_fallback: true
+  # Enable the paper-style GS photometric EKF path only after the Gaussian map is mature.
+  # The gates below keep unstable rendered residuals from perturbing the main LIO/VIO state.
+  pose_update: true
+  pose_update_start_frame: 80
+  pose_update_min_gaussians: 5000
+  pose_update_min_points: 120
+  pose_update_min_measurements: 1500
+  pose_update_max_rmse: 35.0
+  # Clamp plausible but too-large raw GS pose steps into small state updates.
+  pose_update_step_damping: 0.5
+  pose_update_max_raw_rot_deg: 1.0
+  pose_update_max_raw_trans: 0.1
+  max_pose_update_rot_deg: 0.05
+  max_pose_update_trans: 0.005
+  render_jacobian: true
+  # GS render and current image are same-frame quantities; keep exposure out by default.
+  pose_update_exposure: false
+  # Finite-difference pose Jacobian performs 7 extra renders per EKF iteration.
+  # Keep it off for real-time runs; enable only for small-window Jacobian debugging.
+  pose_finite_diff_jacobian: false
+  pose_fd_rot_eps: 0.0001
+  pose_fd_trans_eps: 0.001
+  pose_fd_max_gaussians: 3000
+  save_map_interval: 20
+  # Limit new GS initialization per image frame; <=0 disables this throttle.
+  max_insert_gaussians: 3000
+  # Limit global density per GS root voxel; <=0 disables this density gate.
+  max_points_per_voxel: 300
+  # 0 keeps all in-frame GS candidates; positive caps keep rendering bounded.
+  max_render_gaussians: 20000
+  # Query neighboring GS root voxels around LiDAR-triggered cells to mimic a
+  # sliding active Gaussian window while keeping lookup bounded.
+  active_voxel_radius: 1
+  max_seed_voxels: 2000
+  max_active_voxels: 3000
+  # Bound the persistent GS map for long UAV runs; farthest root voxels are
+  # removed when either limit is exceeded. <=0 disables each gate.
+  max_map_voxels: 8000
+  max_total_gaussians: 1200000
+  prune_interval_frames: 10
+  prune_submap_threshold: 20000
+  output_dir: "Log/GS"
+  plot_gs_render: 0
+  gs_iterations: 10
   gs_position_lr: 0.01
   gs_feature_lr: 0.01
   gs_opacity_lr: 0.1
@@ -101,6 +165,6 @@ gs:
   gs_rotation_lr: 0.01
 
 scale_factor: 0.035
-GS_voxel_size: 1
+GS_voxel_size: 1.0
 root_voxel_size: 0.01
 octree_max_level: 3

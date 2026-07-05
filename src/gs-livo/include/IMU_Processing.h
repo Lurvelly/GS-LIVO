@@ -51,6 +51,7 @@ public:
   ofstream fout_imu;
   double IMU_mean_acc_norm;
   V3D unbiased_gyr;
+  bool last_propagation_success_ = false;
 
   V3D cov_acc;
   V3D cov_gyr;
@@ -65,7 +66,7 @@ public:
   int lidar_type;
 
 private:
-  void IMU_init(const MeasureGroup &meas, StatesGroup &state, int &N);
+  bool IMU_init(const MeasureGroup &meas, StatesGroup &state, int &N);
   void Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out);
   PointCloudXYZI pcl_wait_proc;
   sensor_msgs::ImuConstPtr last_imu;

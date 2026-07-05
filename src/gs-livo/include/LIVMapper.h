@@ -36,7 +36,7 @@ public:
   void handleVIO();
   void handleLIO();
   void savePCD();
-  void processImu();
+  bool processImu();
   
   bool sync_packages(LidarMeasureGroup &meas);
   void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr);
@@ -50,6 +50,7 @@ public:
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
+  void publish_gs_rendered_img(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
   void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
@@ -83,6 +84,15 @@ public:
   double filter_size_pcd = 0;
   double _first_lidar_time = 0.0;
   double match_time = 0, solve_time = 0, solve_const_H_time = 0;
+  double vio_max_update_rot_deg = 5.0;
+  double vio_max_update_trans = 0.5;
+  double vio_max_update_vel = 10.0;
+  double lio_max_update_rot_deg = 5.0;
+  double lio_max_update_trans = 1.0;
+  double lio_max_update_vel = 10.0;
+  double imu_max_prop_rot_deg = 20.0;
+  double imu_max_prop_trans = 3.0;
+  double imu_max_prop_vel = 30.0;
 
   bool lidar_map_inited = false, pcd_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
   int pcd_save_interval = -1, pcd_index = 0;
@@ -102,10 +112,11 @@ public:
 
 
   // 3dgs parameters
-  double scale_factor,scale_factor2,normal_rejecter;
-  int save_GS_iter;
-  double root_voxel_size;
-  int octree_max_level;
+  double scale_factor = 0.0, scale_factor2 = 0.0, normal_rejecter = 0.0;
+  int save_GS_iter = 0;
+  double root_voxel_size = 0.5;
+  double gs_voxel_size = 1.0;
+  int octree_max_level = 3;
   double photometric_thre;
   int gs_iterations= 0;
   int border_gs=0;
@@ -115,6 +126,37 @@ public:
   double gs_opacity_lr= 0.0;
   double gs_scaling_lr= 0.00;
   double gs_rotation_lr= 0.0;
+  bool gs_white_background = false;
+  bool gs_save_results = true;
+  bool gs_save_rendered_images = true;
+  bool gs_save_gt_images = true;
+  bool gs_sparse_vio_fallback_en = true;
+  bool gs_pose_update_en = false;
+  bool gs_render_jacobian_en = true;
+  bool gs_pose_finite_diff_jacobian_en = false;
+  bool gs_pose_update_exposure_en = false;
+  double gs_pose_fd_rot_eps = 1e-4;
+  double gs_pose_fd_trans_eps = 1e-3;
+  int gs_pose_fd_max_gaussians = 3000;
+  int gs_max_insert_gaussians = 3000;
+  int gs_max_points_per_voxel = 300;
+  int gs_pose_update_start_frame = 80;
+  int gs_pose_update_min_gaussians = 5000;
+  int gs_pose_update_min_points = 120;
+  int gs_pose_update_min_measurements = 1500;
+  double gs_pose_update_max_rmse = 35.0;
+  double gs_pose_update_step_damping = 0.5;
+  double gs_pose_update_max_raw_rot_deg = 1.0;
+  double gs_pose_update_max_raw_trans = 0.1;
+  double gs_max_pose_update_rot_deg = 0.2;
+  double gs_max_pose_update_trans = 0.02;
+  int gs_active_voxel_radius = 1;
+  int gs_max_seed_voxels = 2000;
+  int gs_max_active_voxels = 3000;
+  int gs_max_map_voxels = 8000;
+  int gs_max_total_gaussians = 1200000;
+  int gs_prune_interval_frames = 10;
+  string gs_output_dir;
   // 3dgs parameters
 
 
@@ -125,6 +167,7 @@ public:
 
 
   bool gravity_align_en = false, gravity_align_finished = false;
+  bool last_lio_update_accepted = false;
 
   bool sync_jump_flag = false;
 
@@ -200,6 +243,7 @@ public:
   ros::Publisher pubLaserCloudDynRmed;
   ros::Publisher pubLaserCloudDynDbg;
   image_transport::Publisher pubImage;
+  image_transport::Publisher pubImageRender;
   ros::Publisher mavros_pose_publisher;
   ros::Timer imu_prop_timer;
 

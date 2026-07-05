@@ -4,6 +4,9 @@ Project Page: [gs-livo.tech](https://gs-livo.tech) (coming soon)
 
 This repository shows the experimental results of our GS-LIVO system running on various public datasets and real-world scenarios.
 
+安装、依赖配置和本机验证记录见 [INSTALL.md](./INSTALL.md)。
+算法流程和当前 GS 使用状态说明见 [ALGORITHM_LOGIC.md](./ALGORITHM_LOGIC.md)。
+
 ## System Overview and Principles
 
 GS-LIVO (Gaussian Splatting LiDAR-Inertial-Visual Odometry) is a novel SLAM framework that seamlessly integrates LiDAR, inertial, and visual sensors. The system comprises four key modules:

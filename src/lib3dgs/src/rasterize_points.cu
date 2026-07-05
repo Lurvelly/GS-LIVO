@@ -12,7 +12,7 @@
 #include "config.h"
 #include "rasterize_points.cuh"
 #include "rasterizer.h"
-#include <torch/extension.h>
+#include <torch/torch.h>
 #include <tuple>
 
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {

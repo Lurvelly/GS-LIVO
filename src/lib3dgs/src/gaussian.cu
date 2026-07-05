@@ -233,7 +233,7 @@ void cudaProcess(std::vector<GS_point>& voxel_gs_points, PointCloud& pc_his) {
 
 //     // if(cnt==20)
 //     // {
-//     // torch::save(gaussians, "/home/sheng/01sheng/FAST-LIVO/datas/ALL.pt");
+//     // torch::save(gaussians, "debug/ALL.pt");
 //     // }
     
 //     // _xyz = torch::from_blob(GaussianCloud.data(), {static_cast<long>(num_points), 3},
@@ -279,10 +279,10 @@ void cudaProcess(std::vector<GS_point>& voxel_gs_points, PointCloud& pc_his) {
 //     _features_rest = features.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)}).transpose(1, 2).contiguous().set_requires_grad(true);
 //     //   if(cnt==20)
 //     // {
-//     //     torch::save(_xyz, "/home/sheng/01sheng/FAST-LIVO/datas/_xyz.pt");
-//     //     torch::save(_scaling, "/home/sheng/01sheng/FAST-LIVO/datas/_scaling.pt");
-//     //     torch::save(_rotation, "/home/sheng/01sheng/FAST-LIVO/datas/_rotation.pt");
-//     //     torch::save(_features_dc, "/home/sheng/01sheng/FAST-LIVO/datas/_features_dc.pt");
+//     //     torch::save(_xyz, "debug/_xyz.pt");
+//     //     torch::save(_scaling, "debug/_scaling.pt");
+//     //     torch::save(_rotation, "debug/_rotation.pt");
+//     //     torch::save(_features_dc, "debug/_features_dc.pt");
 
 //     // }
 //     // cnt++;
@@ -796,9 +796,9 @@ void GaussianModel::Reset_opacity() {
     auto new_opacity = inverse_sigmoid(torch::ones_like(_opacity, torch::TensorOptions().dtype(torch::kFloat32)) * 0.01f);
 
     auto adamParamStates = std::make_unique<torch::optim::AdamParamState>(static_cast<torch::optim::AdamParamState&>(
-        *_optimizer->state()[c10::guts::to_string(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl())]));
+        *_optimizer->state()[_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl()]));
 
-    _optimizer->state().erase(c10::guts::to_string(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl()));
+    _optimizer->state().erase(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl());
 
     adamParamStates->exp_avg(torch::zeros_like(new_opacity));
     adamParamStates->exp_avg_sq(torch::zeros_like(new_opacity));
@@ -806,20 +806,20 @@ void GaussianModel::Reset_opacity() {
     _optimizer->param_groups()[5].params()[0] = new_opacity.set_requires_grad(true);
     _opacity = _optimizer->param_groups()[5].params()[0];
 
-    _optimizer->state()[c10::guts::to_string(_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl())] = std::move(adamParamStates);
+    _optimizer->state()[_optimizer->param_groups()[5].params()[0].unsafeGetTensorImpl()] = std::move(adamParamStates);
 }
 
 void prune_optimizer(torch::optim::Adam* optimizer, const torch::Tensor& mask, torch::Tensor& old_tensor, int param_position) {
     auto adamParamStates = std::make_unique<torch::optim::AdamParamState>(static_cast<torch::optim::AdamParamState&>(
-        *optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())]));
-    optimizer->state().erase(c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()));
+        *optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()]));
+    optimizer->state().erase(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl());
 
     adamParamStates->exp_avg(adamParamStates->exp_avg().index_select(0, mask));
     adamParamStates->exp_avg_sq(adamParamStates->exp_avg_sq().index_select(0, mask));
 
     optimizer->param_groups()[param_position].params()[0] = old_tensor.index_select(0, mask).set_requires_grad(true);
     old_tensor = optimizer->param_groups()[param_position].params()[0]; // update old tensor
-    optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())] = std::move(adamParamStates);
+    optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()] = std::move(adamParamStates);
 }
 
 void GaussianModel::prune_points(torch::Tensor mask) {
@@ -844,8 +844,8 @@ void cat_tensors_to_optimizer(torch::optim::Adam* optimizer,
                               torch::Tensor& old_tensor,
                               int param_position) {
     auto adamParamStates = std::make_unique<torch::optim::AdamParamState>(static_cast<torch::optim::AdamParamState&>(
-        *optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())]));
-    optimizer->state().erase(c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()));
+        *optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()]));
+    optimizer->state().erase(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl());
 
     adamParamStates->exp_avg(torch::cat({adamParamStates->exp_avg(), torch::zeros_like(extension_tensor)}, 0));
     adamParamStates->exp_avg_sq(torch::cat({adamParamStates->exp_avg_sq(), torch::zeros_like(extension_tensor)}, 0));
@@ -853,7 +853,7 @@ void cat_tensors_to_optimizer(torch::optim::Adam* optimizer,
     optimizer->param_groups()[param_position].params()[0] = torch::cat({old_tensor, extension_tensor}, 0).set_requires_grad(true);
     old_tensor = optimizer->param_groups()[param_position].params()[0];
 
-    optimizer->state()[c10::guts::to_string(optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl())] = std::move(adamParamStates);
+    optimizer->state()[optimizer->param_groups()[param_position].params()[0].unsafeGetTensorImpl()] = std::move(adamParamStates);
 }
 
 void GaussianModel::densification_postfix(torch::Tensor& new_xyz,
@@ -906,7 +906,8 @@ void GaussianModel::densify_and_split(torch::Tensor& grads, float grad_threshold
 
 void GaussianModel::densify_and_clone(torch::Tensor& grads, float grad_threshold, float scene_extent) {
     // Extract points that satisfy the gradient condition
-    torch::Tensor selected_pts_mask = torch::where(torch::linalg::vector_norm(grads, {2}, 1, true, torch::kFloat32) >= grad_threshold,
+    auto grad_norm = torch::sqrt(torch::sum(grads * grads, 1, true));
+    torch::Tensor selected_pts_mask = torch::where(grad_norm >= grad_threshold,
                                                    torch::ones_like(grads.index({torch::indexing::Slice()})).to(torch::kBool),
                                                    torch::zeros_like(grads.index({torch::indexing::Slice()})).to(torch::kBool))
                                           .to(torch::kLong);
@@ -1099,8 +1100,7 @@ void GaussianModel::Save_ply_our(const std::filesystem::path& file_path,std::vec
 
 
 std::cout<<"inited GS to attributes"<<std::endl;
-    Write_output_ply("/home/sheng/01sheng/gaussian-splatting/output/55023a9e-1/point_cloud/iteration_30000/point_cloud.ply", tensor_attributes, attributes);
-        // Write_output_ply(folder / "point_cloud.ply", tensor_attributes, attributes);
+    Write_output_ply(file_path, tensor_attributes, attributes);
 
 std::cout<<" GS saved"<<std::endl;
 
@@ -1182,11 +1182,7 @@ std::vector<torch::Tensor> tensor_attributes = {xyz.clone(),
 
 
     std::cout<<"inited GS to attributes"<<std::endl;
-    // auto folder = file_path / ("point_cloud/iteration_999999");
-    // Write_output_ply(folder / "point_cloud.ply", tensor_attributes, attributes);
-    // "/home/sheng/01sheng/gaussian-splatting/output/55023a9e-1/point_cloud/iteration_30000/point_cloud.ply"
-    auto folder = "/home/sheng/01sheng/gaussian-splatting/output/55023a9e-1/point_cloud/iteration_30000/"/file_path;
-    Write_output_ply(folder, tensor_attributes, attributes);
+    Write_output_ply(file_path, tensor_attributes, attributes);
     std::cout<<" GS saved"<<std::endl;
 
                                                 
@@ -1243,7 +1239,7 @@ std::vector<torch::Tensor> tensor_attributes = {xyz.clone(),
 //     std::cout<<"inited GS to attributes"<<std::endl;
 //     auto folder = file_path / ("point_cloud/iteration_999999");
 //     // Write_output_ply(folder / "point_cloud.ply", tensor_attributes, attributes);
-//     Write_output_ply("/home/sheng/01sheng/gaussian-splatting/output/55023a9e-1/point_cloud/iteration_30000/point_cloud.ply", tensor_attributes, attributes);
+//     Write_output_ply(folder / "point_cloud.ply", tensor_attributes, attributes);
 //     std::cout<<" GS saved"<<std::endl;
 
 // }

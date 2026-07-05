@@ -12,6 +12,94 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace
+{
+bool isFiniteMappingState(const StatesGroup &state)
+{
+  return state.rot_end.allFinite() &&
+         state.pos_end.allFinite() &&
+         state.vel_end.allFinite() &&
+         state.bias_g.allFinite() &&
+         state.bias_a.allFinite() &&
+         state.gravity.allFinite() &&
+         state.cov.allFinite() &&
+         std::isfinite(state.inv_expo_time);
+}
+
+bool isFinitePointWithVarForMapping(const pointWithVar &pv)
+{
+  return pv.point_b.allFinite() &&
+         pv.point_w.allFinite() &&
+         pv.body_var.allFinite() &&
+         pv.var.allFinite() &&
+         pv.point_crossmat.allFinite();
+}
+
+bool isFinitePointForMapping(const PointType &point)
+{
+  return std::isfinite(point.x) &&
+         std::isfinite(point.y) &&
+         std::isfinite(point.z) &&
+         std::isfinite(point.curvature);
+}
+
+size_t filterFinitePointCloud(const PointCloudXYZI::Ptr &cloud)
+{
+  if (cloud == nullptr) return 0;
+
+  PointCloudXYZI filtered;
+  filtered.header = cloud->header;
+  filtered.points.reserve(cloud->points.size());
+  for (const auto &point : cloud->points)
+  {
+    if (isFinitePointForMapping(point)) filtered.points.push_back(point);
+  }
+  const size_t removed = cloud->points.size() - filtered.points.size();
+  filtered.width = static_cast<uint32_t>(filtered.points.size());
+  filtered.height = 1;
+  filtered.is_dense = true;
+  *cloud = filtered;
+  return removed;
+}
+
+size_t filterFinitePointCloudPair(const PointCloudXYZI::Ptr &body_cloud, const PointCloudXYZI::Ptr &world_cloud)
+{
+  if (body_cloud == nullptr || world_cloud == nullptr) return 0;
+
+  const size_t pair_size = std::min(body_cloud->points.size(), world_cloud->points.size());
+  PointCloudXYZI filtered_body;
+  PointCloudXYZI filtered_world;
+  filtered_body.header = body_cloud->header;
+  filtered_world.header = world_cloud->header;
+  filtered_body.points.reserve(pair_size);
+  filtered_world.points.reserve(pair_size);
+  for (size_t i = 0; i < pair_size; i++)
+  {
+    if (!isFinitePointForMapping(body_cloud->points[i]) ||
+        !isFinitePointForMapping(world_cloud->points[i]))
+    {
+      continue;
+    }
+    filtered_body.points.push_back(body_cloud->points[i]);
+    filtered_world.points.push_back(world_cloud->points[i]);
+  }
+  const size_t removed = std::max(body_cloud->points.size(), world_cloud->points.size()) - filtered_body.points.size();
+  filtered_body.width = static_cast<uint32_t>(filtered_body.points.size());
+  filtered_body.height = 1;
+  filtered_body.is_dense = true;
+  filtered_world.width = static_cast<uint32_t>(filtered_world.points.size());
+  filtered_world.height = 1;
+  filtered_world.is_dense = true;
+  *body_cloud = filtered_body;
+  *world_cloud = filtered_world;
+  return removed;
+}
+} // namespace
+
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
       extR(M3D::Identity())
@@ -68,8 +156,14 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<int>("vio/patch_pyrimid_level", patch_pyrimid_level, 3);
   nh.param<int>("vio/patch_size", patch_size, 8);
   nh.param<double>("vio/outlier_threshold", outlier_threshold, 1000);
-  nh.param<double>("outlier_threshold2", outlier_threshold2, 100);
-  nh.param<double>("outlier_threshold3", outlier_threshold3, 100);
+  nh.param<double>("vio/max_update_rot_deg", vio_max_update_rot_deg, 5.0);
+  nh.param<double>("vio/max_update_trans", vio_max_update_trans, 0.5);
+  nh.param<double>("vio/max_update_vel", vio_max_update_vel, 10.0);
+  nh.param<double>("outlier_threshold2", outlier_threshold2, 50000);
+  nh.param<double>("outlier_threshold3", outlier_threshold3, 0);
+  nh.param<double>("lio/max_update_rot_deg", lio_max_update_rot_deg, 5.0);
+  nh.param<double>("lio/max_update_trans", lio_max_update_trans, 1.0);
+  nh.param<double>("lio/max_update_vel", lio_max_update_vel, 10.0);
 
   nh.param<double>("time_offset/exposure_time_init", exposure_time_init, 0.0);
   nh.param<double>("time_offset/img_time_offset", img_time_offset, 0.0);
@@ -86,6 +180,9 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
+  nh.param<double>("imu/max_prop_rot_deg", imu_max_prop_rot_deg, 20.0);
+  nh.param<double>("imu/max_prop_trans", imu_max_prop_trans, 3.0);
+  nh.param<double>("imu/max_prop_vel", imu_max_prop_vel, 30.0);
 
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<double>("preprocess/filter_size_surf", filter_size_surf_min, 0.5);
@@ -118,11 +215,49 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("scale_factor", scale_factor, 3.4);
   nh.param<double>("scale_factor2", scale_factor2, 3.4);
   nh.param<double>("root_voxel_size", root_voxel_size, 0.5);
+  nh.param<double>("GS_voxel_size", gs_voxel_size, 1.0);
+  nh.param<double>("gs/voxel_size", gs_voxel_size, gs_voxel_size);
   nh.param<int>("octree_max_level", octree_max_level, 3);
 
   nh.param<int>("gs/gs_iterations", gs_iterations, 4);
   nh.param<int>("gs/border_gs",  border_gs, 4);
   nh.param<int>("gs/plot_gs_render", plot_gs_render, 0);
+  nh.param<bool>("gs/white_background", gs_white_background, false);
+  nh.param<bool>("gs/save_results", gs_save_results, true);
+  nh.param<bool>("gs/save_rendered_images", gs_save_rendered_images, true);
+  nh.param<bool>("gs/save_gt_images", gs_save_gt_images, true);
+  nh.param<bool>("gs/sparse_vio_fallback", gs_sparse_vio_fallback_en, true);
+  nh.param<bool>("gs/pose_update", gs_pose_update_en, false);
+  nh.param<bool>("gs/render_jacobian", gs_render_jacobian_en, true);
+  nh.param<bool>("gs/pose_finite_diff_jacobian", gs_pose_finite_diff_jacobian_en, false);
+  nh.param<bool>("gs/pose_update_exposure", gs_pose_update_exposure_en, false);
+  nh.param<double>("gs/pose_fd_rot_eps", gs_pose_fd_rot_eps, 1e-4);
+  nh.param<double>("gs/pose_fd_trans_eps", gs_pose_fd_trans_eps, 1e-3);
+  nh.param<int>("gs/pose_fd_max_gaussians", gs_pose_fd_max_gaussians, 3000);
+  nh.param<int>("gs/max_insert_gaussians", gs_max_insert_gaussians, 3000);
+  nh.param<int>("gs/max_points_per_voxel", gs_max_points_per_voxel, 300);
+  nh.param<int>("gs/pose_update_start_frame", gs_pose_update_start_frame, 80);
+  nh.param<int>("gs/pose_update_min_gaussians", gs_pose_update_min_gaussians, 5000);
+  nh.param<int>("gs/pose_update_min_points", gs_pose_update_min_points, 120);
+  nh.param<int>("gs/pose_update_min_measurements", gs_pose_update_min_measurements, 1500);
+  nh.param<double>("gs/pose_update_max_rmse", gs_pose_update_max_rmse, 35.0);
+  nh.param<double>("gs/pose_update_step_damping", gs_pose_update_step_damping, 0.5);
+  nh.param<double>("gs/pose_update_max_raw_rot_deg", gs_pose_update_max_raw_rot_deg, 1.0);
+  nh.param<double>("gs/pose_update_max_raw_trans", gs_pose_update_max_raw_trans, 0.1);
+  nh.param<double>("gs/max_pose_update_rot_deg", gs_max_pose_update_rot_deg, 0.2);
+  nh.param<double>("gs/max_pose_update_trans", gs_max_pose_update_trans, 0.02);
+  nh.param<int>("gs/active_voxel_radius", gs_active_voxel_radius, 1);
+  nh.param<int>("gs/max_seed_voxels", gs_max_seed_voxels, 2000);
+  nh.param<int>("gs/max_active_voxels", gs_max_active_voxels, 3000);
+  nh.param<int>("gs/max_map_voxels", gs_max_map_voxels, 8000);
+  nh.param<int>("gs/max_total_gaussians", gs_max_total_gaussians, 1200000);
+  nh.param<int>("gs/prune_interval_frames", gs_prune_interval_frames, 10);
+  nh.param<int>("gs/save_GS_iter", save_GS_iter, 20);
+  nh.param<int>("gs/save_map_interval", save_GS_iter, save_GS_iter);
+  nh.param<double>("gs/prune_submap_threshold", outlier_threshold2, outlier_threshold2);
+  nh.param<double>("gs/max_render_gaussians", outlier_threshold3, outlier_threshold3);
+  nh.param<string>("gs/output_dir", gs_output_dir, std::string(ROOT_DIR) + "Log/GS");
+  nh.param<double>("gs/normal_rejecter", normal_rejecter, 0.0);
   nh.param<double>("gs/gs_position_lr", gs_position_lr, 0.00016);
   nh.param<double>("gs/gs_feature_lr", gs_feature_lr, 0.005);
   nh.param<double>("gs/gs_opacity_lr", gs_opacity_lr, 0.05);
@@ -155,6 +290,11 @@ void LIVMapper::initializeComponents()
   vio_manager->max_iterations = max_iterations;
   vio_manager->img_point_cov = IMG_POINT_COV;
   vio_manager->normal_en = normal_en;
+  vio_manager->vio_max_update_rot_deg = vio_max_update_rot_deg;
+  vio_manager->vio_max_update_trans = vio_max_update_trans;
+  vio_manager->vio_max_update_vel = vio_max_update_vel;
+  vio_manager->outlier_threshold2 = outlier_threshold2;
+  vio_manager->outlier_threshold3 = outlier_threshold3;
   vio_manager->inverse_composition_en = inverse_composition_en;
   vio_manager->raycast_en = raycast_en;
   vio_manager->grid_n_width = grid_n_width;
@@ -166,11 +306,43 @@ void LIVMapper::initializeComponents()
 
   // 3dgs parameters
   vio_manager->scale_factor= (scale_factor);
-  vio_manager->scale_factor2= (root_voxel_size/octree_max_level)*scale_factor;
+  vio_manager->scale_factor2 = gs_voxel_size * scale_factor;
   vio_manager->normal_rejecter= (normal_rejecter);
   vio_manager->save_GS_iter=save_GS_iter;
   vio_manager->root_voxel_size= root_voxel_size;
+  vio_manager->gs_voxel_size= gs_voxel_size;
   vio_manager->octree_max_level= octree_max_level;
+  vio_manager->gs_white_background = gs_white_background;
+  vio_manager->gs_save_results = gs_save_results;
+  vio_manager->gs_save_rendered_images = gs_save_rendered_images;
+  vio_manager->gs_save_gt_images = gs_save_gt_images;
+  vio_manager->gs_sparse_vio_fallback_en = gs_sparse_vio_fallback_en;
+  vio_manager->gs_pose_update_en = gs_pose_update_en;
+  vio_manager->gs_render_jacobian_en = gs_render_jacobian_en;
+  vio_manager->gs_pose_finite_diff_jacobian_en = gs_pose_finite_diff_jacobian_en;
+  vio_manager->gs_pose_update_exposure_en = gs_pose_update_exposure_en;
+  vio_manager->gs_pose_fd_rot_eps = gs_pose_fd_rot_eps;
+  vio_manager->gs_pose_fd_trans_eps = gs_pose_fd_trans_eps;
+  vio_manager->gs_pose_fd_max_gaussians = gs_pose_fd_max_gaussians;
+  vio_manager->gs_max_insert_gaussians = gs_max_insert_gaussians;
+  vio_manager->gs_max_points_per_voxel = gs_max_points_per_voxel;
+  vio_manager->gs_pose_update_start_frame = gs_pose_update_start_frame;
+  vio_manager->gs_pose_update_min_gaussians = gs_pose_update_min_gaussians;
+  vio_manager->gs_pose_update_min_points = gs_pose_update_min_points;
+  vio_manager->gs_pose_update_min_measurements = gs_pose_update_min_measurements;
+  vio_manager->gs_pose_update_max_rmse = gs_pose_update_max_rmse;
+  vio_manager->gs_pose_update_step_damping = gs_pose_update_step_damping;
+  vio_manager->gs_pose_update_max_raw_rot_deg = gs_pose_update_max_raw_rot_deg;
+  vio_manager->gs_pose_update_max_raw_trans = gs_pose_update_max_raw_trans;
+  vio_manager->gs_max_pose_update_rot_deg = gs_max_pose_update_rot_deg;
+  vio_manager->gs_max_pose_update_trans = gs_max_pose_update_trans;
+  vio_manager->gs_active_voxel_radius = gs_active_voxel_radius;
+  vio_manager->gs_max_seed_voxels = gs_max_seed_voxels;
+  vio_manager->gs_max_active_voxels = gs_max_active_voxels;
+  vio_manager->gs_max_map_voxels = gs_max_map_voxels;
+  vio_manager->gs_max_total_gaussians = gs_max_total_gaussians;
+  vio_manager->gs_prune_interval_frames = gs_prune_interval_frames;
+  vio_manager->gs_output_dir = gs_output_dir;
   vio_manager->gs_params.iterations = gs_iterations;
   vio_manager->plot_gs_render = plot_gs_render;
   vio_manager->gs_params.position_lr_init = gs_position_lr;
@@ -178,7 +350,7 @@ void LIVMapper::initializeComponents()
   vio_manager->gs_params.opacity_lr = gs_opacity_lr;
   vio_manager->gs_params.scaling_lr = gs_scaling_lr;
   vio_manager->gs_params.rotation_lr = gs_rotation_lr;
-  // vio_manager->border_gs = border_gs;
+  vio_manager->border_gs = border_gs;
   // 3dgs parameters
 
 
@@ -250,6 +422,7 @@ void LIVMapper::initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_tr
   pubLaserCloudDynDbg = nh.advertise<sensor_msgs::PointCloud2>("/dyn_obj_dbg_hist", 100);
   mavros_pose_publisher = nh.advertise<geometry_msgs::PoseStamped>("/mavros/vision_pose/pose", 10);
   pubImage = it.advertise("/rgb_img", 1);
+  pubImageRender = it.advertise("/gs_rendered_img", 1);
   pubImuPropOdom = nh.advertise<nav_msgs::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = nh.createTimer(ros::Duration(0.004), &LIVMapper::imu_prop_callback, this);
   voxelmap_manager->voxel_map_pub_= nh.advertise<visualization_msgs::MarkerArray>("/planes", 10000);
@@ -259,6 +432,13 @@ void LIVMapper::handleFirstFrame()
 {
   if (!is_first_frame)
   {
+    if (!std::isfinite(LidarMeasures.last_lio_update_time) ||
+        LidarMeasures.last_lio_update_time < 0.0)
+    {
+      std::cout << "[ Sync ] skip first lidar time init: invalid last_lio_update_time="
+                << LidarMeasures.last_lio_update_time << std::endl;
+      return;
+    }
     _first_lidar_time = LidarMeasures.last_lio_update_time;
     p_imu->first_lidar_time = _first_lidar_time; // Only for IMU data log
     is_first_frame = true;
@@ -271,26 +451,106 @@ void LIVMapper::gravityAlignment()
   if (!p_imu->imu_need_init && !gravity_align_finished) 
   {
     std::cout << "Gravity Alignment Starts" << std::endl;
+    const StatesGroup state_before_align = _state;
     V3D ez(0, 0, -1), gz(_state.gravity);
+    const double gravity_norm = gz.norm();
+    if (!gz.allFinite() || !std::isfinite(gravity_norm) || gravity_norm < 1e-6)
+    {
+      std::cout << "[ IMU ] skip gravity alignment: invalid gravity "
+                << gz.transpose() << std::endl;
+      return;
+    }
     Quaterniond G_q_I0 = Quaterniond::FromTwoVectors(gz, ez);
     M3D G_R_I0 = G_q_I0.toRotationMatrix();
+    if (!G_R_I0.allFinite())
+    {
+      std::cout << "[ IMU ] skip gravity alignment: non-finite alignment rotation" << std::endl;
+      return;
+    }
 
     _state.pos_end = G_R_I0 * _state.pos_end;
     _state.rot_end = G_R_I0 * _state.rot_end;
     _state.vel_end = G_R_I0 * _state.vel_end;
     _state.gravity = G_R_I0 * _state.gravity;
+    if (!_state.pos_end.allFinite() || !_state.rot_end.allFinite() ||
+        !_state.vel_end.allFinite() || !_state.gravity.allFinite())
+    {
+      std::cout << "[ IMU ] reject gravity alignment: non-finite aligned state" << std::endl;
+      _state = state_before_align;
+      return;
+    }
     gravity_align_finished = true;
     std::cout << "Gravity Alignment Finished" << std::endl;
   }
 }
 
-void LIVMapper::processImu() 
+bool LIVMapper::processImu()
 {
   // double t0 = omp_get_wtime();
 
+  const StatesGroup state_before_imu = _state;
+  const bool imu_was_initializing = p_imu->imu_need_init;
   p_imu->Process2(LidarMeasures, _state, feats_undistort);
+  if (imu_was_initializing || p_imu->imu_need_init)
+  {
+    state_propagat = _state;
+    voxelmap_manager->state_ = _state;
+    voxelmap_manager->feats_undistort_ = feats_undistort;
+    if (feats_undistort) feats_undistort->clear();
+    return false;
+  }
+
+  VD(DIM_STATE) imu_delta = _state - state_before_imu;
+  const double imu_rot_delta_deg = imu_delta.block<3, 1>(0, 0).norm() * 57.29577951308232;
+  const double imu_trans_delta = imu_delta.block<3, 1>(3, 0).norm();
+  const double imu_vel_delta = imu_delta.block<3, 1>(7, 0).norm();
+  const bool imu_state_finite = _state.rot_end.allFinite() &&
+                                _state.pos_end.allFinite() &&
+                                _state.vel_end.allFinite() &&
+                                _state.bias_g.allFinite() &&
+                                _state.bias_a.allFinite() &&
+                                _state.gravity.allFinite() &&
+                                _state.cov.allFinite() &&
+                                std::isfinite(_state.inv_expo_time);
+  const bool imu_rot_too_large = imu_max_prop_rot_deg > 0.0 && imu_rot_delta_deg > imu_max_prop_rot_deg;
+  const bool imu_trans_too_large = imu_max_prop_trans > 0.0 && imu_trans_delta > imu_max_prop_trans;
+  const bool imu_vel_too_large = imu_max_prop_vel > 0.0 && imu_vel_delta > imu_max_prop_vel;
+  const bool imu_process_success = p_imu->last_propagation_success_;
+  if (!imu_process_success || !imu_state_finite || imu_rot_too_large || imu_trans_too_large || imu_vel_too_large)
+  {
+    std::cout << "[ IMU ] propagation rejected: finite_state="
+              << (imu_state_finite ? "true" : "false")
+              << ", process_success=" << (imu_process_success ? "true" : "false")
+              << ", rot_deg=" << imu_rot_delta_deg << " (max=" << imu_max_prop_rot_deg << ")"
+              << ", trans=" << imu_trans_delta << " (max=" << imu_max_prop_trans << ")"
+              << ", vel=" << imu_vel_delta << " (max=" << imu_max_prop_vel << ")"
+              << std::endl;
+    _state = state_before_imu;
+    if (feats_undistort) feats_undistort->clear();
+    state_propagat = _state;
+    voxelmap_manager->state_ = _state;
+    voxelmap_manager->feats_undistort_ = feats_undistort;
+    return false;
+  }
 
   if (gravity_align_en) gravityAlignment();
+  if (!_state.rot_end.allFinite() ||
+      !_state.pos_end.allFinite() ||
+      !_state.vel_end.allFinite() ||
+      !_state.bias_g.allFinite() ||
+      !_state.bias_a.allFinite() ||
+      !_state.gravity.allFinite() ||
+      !_state.cov.allFinite() ||
+      !std::isfinite(_state.inv_expo_time))
+  {
+    std::cout << "[ IMU ] propagation rejected after gravity alignment: non-finite state" << std::endl;
+    _state = state_before_imu;
+    if (feats_undistort) feats_undistort->clear();
+    state_propagat = _state;
+    voxelmap_manager->state_ = _state;
+    voxelmap_manager->feats_undistort_ = feats_undistort;
+    return false;
+  }
 
   state_propagat = _state;
   voxelmap_manager->state_ = _state;
@@ -301,6 +561,7 @@ void LIVMapper::processImu()
   // std::cout << "[ Mapping ] feats_undistort: " << feats_undistort->size() << std::endl;
   // std::cout << "[ Mapping ] predict cov: " << _state.cov.diagonal().transpose() << std::endl;
   // std::cout << "[ Mapping ] predict sta: " << state_propagat.pos_end.transpose() << state_propagat.vel_end.transpose() << std::endl;
+  return true;
 }
 
 void LIVMapper::stateEstimationAndMapping() 
@@ -323,13 +584,33 @@ void LIVMapper::handleVIO()
   fout_pre << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << std::endl;
-    
-  if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr)) 
+
+  if (!last_lio_update_accepted || _pv_list.empty())
+  {
+    std::cout << "[ VIO ] Skip frame: previous LIO update was rejected or has no current pv_list" << std::endl;
+    return;
+  }
+
+  if ((pcl_w_wait_pub == nullptr) || pcl_w_wait_pub->empty())
   {
     std::cout << "[ VIO ] No point!!!" << std::endl;
     return;
   }
-    
+
+  if (LidarMeasures.measures.empty() || LidarMeasures.measures.back().img.empty())
+  {
+    std::cout << "[ VIO ] Skip frame: empty image measurement" << std::endl;
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
+    return;
+  }
+
+  if (!isFiniteMappingState(_state))
+  {
+    std::cout << "[ VIO ] Skip frame: non-finite state before visual update" << std::endl;
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
+    return;
+  }
+
   std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
 
   if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1)) 
@@ -342,6 +623,13 @@ void LIVMapper::handleVIO()
   }
 
   vio_manager->processFrameGS(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
+
+  if (!isFiniteMappingState(_state) || vio_manager->new_frame_ == nullptr || vio_manager->img_cp.empty())
+  {
+    std::cout << "[ VIO ] Skip publish: visual update did not produce a valid current frame" << std::endl;
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
+    return;
+  }
 
   if (imu_prop_enable) 
   {
@@ -365,6 +653,7 @@ void LIVMapper::handleVIO()
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   publish_img_rgb(pubImage, vio_manager);
+  publish_gs_rendered_img(pubImageRender, vio_manager);
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -374,14 +663,38 @@ void LIVMapper::handleVIO()
 
 void LIVMapper::handleLIO() 
 {    
+  last_lio_update_accepted = false;
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
            << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << endl;
            
-  if (feats_undistort->empty() || (feats_undistort == nullptr)) 
+  if ((feats_undistort == nullptr) || feats_undistort->empty())
   {
     std::cout << "[ LIO ]: No point!!!" << std::endl;
+    _pv_list.clear();
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
+    return;
+  }
+
+  const size_t removed_invalid_raw = filterFinitePointCloud(feats_undistort);
+  if (removed_invalid_raw > 0)
+  {
+    std::cout << "[ LIO ] filtered " << removed_invalid_raw
+              << " non-finite undistorted points" << std::endl;
+  }
+  if (feats_undistort->empty())
+  {
+    std::cout << "[ LIO ] update rejected: no finite undistorted point" << std::endl;
+    _pv_list.clear();
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
+    return;
+  }
+  if (!isFiniteMappingState(_state))
+  {
+    std::cout << "[ LIO ] update rejected: non-finite input state before lidar transform" << std::endl;
+    _pv_list.clear();
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
     return;
   }
 
@@ -389,26 +702,98 @@ void LIVMapper::handleLIO()
 
   downSizeFilterSurf.setInputCloud(feats_undistort);
   downSizeFilterSurf.filter(*feats_down_body);
+  const size_t removed_invalid_down = filterFinitePointCloud(feats_down_body);
+  if (removed_invalid_down > 0)
+  {
+    std::cout << "[ LIO ] filtered " << removed_invalid_down
+              << " non-finite downsampled points" << std::endl;
+  }
   
   double t_down = omp_get_wtime();
 
+  transformLidar(_state.rot_end, _state.pos_end, feats_down_body, feats_down_world);
+  const size_t removed_invalid_pair = filterFinitePointCloudPair(feats_down_body, feats_down_world);
+  if (removed_invalid_pair > 0)
+  {
+    std::cout << "[ LIO ] filtered " << removed_invalid_pair
+              << " non-finite transformed point pairs" << std::endl;
+  }
+
   feats_down_size = feats_down_body->points.size();
   voxelmap_manager->feats_down_body_ = feats_down_body;
-  transformLidar(_state.rot_end, _state.pos_end, feats_down_body, feats_down_world);
   voxelmap_manager->feats_down_world_ = feats_down_world;
   voxelmap_manager->feats_down_size_ = feats_down_size;
-  
-  if (!lidar_map_inited) 
+
+  if (feats_down_size == 0)
   {
-    lidar_map_inited = true;
-    voxelmap_manager->BuildVoxelMap();
+    std::cout << "[ LIO ] update rejected: no downsampled point" << std::endl;
+    _pv_list.clear();
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
+    return;
   }
 
   double t1 = omp_get_wtime();
 
-  voxelmap_manager->StateEstimation(state_propagat);
-  _state = voxelmap_manager->state_;
-  _pv_list = voxelmap_manager->pv_list_;
+  const StatesGroup lio_state_before = _state;
+  bool lio_update_accepted = true;
+  const bool lio_bootstrap_frame = !lidar_map_inited;
+  if (lio_bootstrap_frame)
+  {
+    if (!isFiniteMappingState(_state))
+    {
+      lio_update_accepted = false;
+      std::cout << "[ LIO ] bootstrap rejected: non-finite propagated state" << std::endl;
+    }
+    else
+    {
+      voxelmap_manager->BuildVoxelMap();
+      if (voxelmap_manager->pv_list_.empty())
+      {
+        lio_update_accepted = false;
+        std::cout << "[ LIO ] bootstrap rejected: no finite points for voxel map" << std::endl;
+      }
+      else
+      {
+        lidar_map_inited = true;
+        voxelmap_manager->position_last_ = _state.pos_end;
+      }
+    }
+  }
+  else
+  {
+    voxelmap_manager->StateEstimation(state_propagat);
+    StatesGroup lio_candidate_state = voxelmap_manager->state_;
+    VD(DIM_STATE) lio_delta = lio_candidate_state - lio_state_before;
+    const double lio_rot_delta_deg = lio_delta.block<3, 1>(0, 0).norm() * 57.29577951308232;
+    const double lio_trans_delta = lio_delta.block<3, 1>(3, 0).norm();
+    const double lio_vel_delta = lio_delta.block<3, 1>(7, 0).norm();
+    const bool lio_state_finite = isFiniteMappingState(lio_candidate_state);
+    const bool lio_has_enough_features =
+        voxelmap_manager->effct_feat_num_ >= voxelmap_manager->config_setting_.min_effective_features_;
+    const bool lio_estimation_success = voxelmap_manager->last_update_success_;
+    const bool lio_rot_too_large = lio_max_update_rot_deg > 0.0 && lio_rot_delta_deg > lio_max_update_rot_deg;
+    const bool lio_trans_too_large = lio_max_update_trans > 0.0 && lio_trans_delta > lio_max_update_trans;
+    const bool lio_vel_too_large = lio_max_update_vel > 0.0 && lio_vel_delta > lio_max_update_vel;
+    if (!lio_state_finite || !lio_has_enough_features || !lio_estimation_success || lio_rot_too_large || lio_trans_too_large || lio_vel_too_large)
+    {
+      lio_update_accepted = false;
+      _state = lio_state_before;
+      voxelmap_manager->state_ = lio_state_before;
+      voxelmap_manager->position_last_ = lio_state_before.pos_end;
+      std::cout << "[ LIO ] update rejected: finite_state=" << (lio_state_finite ? "true" : "false")
+                << ", effective_features=" << voxelmap_manager->effct_feat_num_
+                << " (min=" << voxelmap_manager->config_setting_.min_effective_features_ << ")"
+                << ", estimation_success=" << (lio_estimation_success ? "true" : "false")
+                << ", rot_deg=" << lio_rot_delta_deg << " (max=" << lio_max_update_rot_deg << ")"
+                << ", trans=" << lio_trans_delta << " (max=" << lio_max_update_trans << ")"
+                << ", vel=" << lio_vel_delta << " (max=" << lio_max_update_vel << ")"
+                << std::endl;
+    }
+    else
+    {
+      _state = lio_candidate_state;
+    }
+  }
 
   double t2 = omp_get_wtime();
 
@@ -449,41 +834,85 @@ void LIVMapper::handleLIO()
 
   double t3 = omp_get_wtime();
 
-  PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
-  transformLidar(_state.rot_end, _state.pos_end, feats_down_body, world_lidar);
-  for (size_t i = 0; i < world_lidar->points.size(); i++) 
+  if (lio_update_accepted)
   {
-    voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
-    M3D point_crossmat = voxelmap_manager->cross_mat_list_[i];
-    M3D var = voxelmap_manager->body_cov_list_[i];
-    var = (_state.rot_end * extR) * var * (_state.rot_end * extR).transpose() +
-          (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
-    voxelmap_manager->pv_list_[i].var = var;
+    if (lio_bootstrap_frame)
+    {
+      std::cout << "[ LIO ] Bootstrap Voxel Map, points=" << voxelmap_manager->pv_list_.size() << std::endl;
+    }
+    else
+    {
+      PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
+      transformLidar(_state.rot_end, _state.pos_end, feats_down_body, world_lidar);
+      for (size_t i = 0; i < world_lidar->points.size(); i++)
+      {
+        voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
+        M3D point_crossmat = voxelmap_manager->cross_mat_list_[i];
+        M3D var = voxelmap_manager->body_cov_list_[i];
+        var = (_state.rot_end * extR) * var * (_state.rot_end * extR).transpose() +
+              (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
+        voxelmap_manager->pv_list_[i].var = var;
+      }
+      voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
+      std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+    }
+    _pv_list.clear();
+    _pv_list.reserve(voxelmap_manager->pv_list_.size());
+    for (const auto &pv : voxelmap_manager->pv_list_)
+    {
+      if (isFinitePointWithVarForMapping(pv)) _pv_list.push_back(pv);
+    }
+    if (_pv_list.empty())
+    {
+      last_lio_update_accepted = false;
+      std::cout << "[ LIO ] Skip VIO seed: accepted LIO state has no finite pv_list" << std::endl;
+    }
+    else
+    {
+      last_lio_update_accepted = true;
+    }
   }
-  voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
-  _pv_list = voxelmap_manager->pv_list_;
+  else
+  {
+    std::cout << "[ LIO ] Skip voxel map update for rejected state" << std::endl;
+    _pv_list.clear();
+  }
   
   double t4 = omp_get_wtime();
 
-  if(voxelmap_manager->config_setting_.map_sliding_en)
+  if(lio_update_accepted && voxelmap_manager->config_setting_.map_sliding_en)
   {
     voxelmap_manager->mapSliding();
   }
-  
-  PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
-  int size = laserCloudFullRes->points.size();
-  PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
-  for (int i = 0; i < size; i++) 
+  if (lio_update_accepted)
   {
-    RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
-  }
-  *pcl_w_wait_pub = *laserCloudWorld;
+    if (feats_undistort) filterFinitePointCloud(feats_undistort);
+    PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
+    int size = laserCloudFullRes->points.size();
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI());
+    laserCloudWorld->points.reserve(size);
 
-  if (!img_en) publish_frame_world(pubLaserCloudFullRes, vio_manager);
-  if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
-  if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
+    for (int i = 0; i < size; i++)
+    {
+      PointType point_world;
+      RGBpointBodyToWorld(&laserCloudFullRes->points[i], &point_world);
+      if (isFinitePointForMapping(point_world)) laserCloudWorld->points.push_back(point_world);
+    }
+    laserCloudWorld->width = static_cast<uint32_t>(laserCloudWorld->points.size());
+    laserCloudWorld->height = 1;
+    laserCloudWorld->is_dense = true;
+    *pcl_w_wait_pub = *laserCloudWorld;
+
+    if (!img_en) publish_frame_world(pubLaserCloudFullRes, vio_manager);
+    if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
+    if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
+  }
+  else
+  {
+    if (pcl_w_wait_pub) pcl_w_wait_pub->clear();
+    std::cout << "[ LIO ] Skip current frame point output for rejected state" << std::endl;
+  }
   publish_path(pubPath);
   publish_mavros(mavros_pose_publisher);
 
@@ -581,9 +1010,28 @@ void LIVMapper::run()
       rate.sleep();
       continue;
     }
-    handleFirstFrame();
+    const bool imu_initializing_before = p_imu->imu_need_init;
+    if (!processImu())
+    {
+      if (!imu_initializing_before && !p_imu->imu_need_init)
+      {
+        if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == LIO && !img_buffer.empty())
+        {
+          img_buffer.pop_front();
+          img_time_buffer.pop_front();
+        }
+        LidarMeasures.measures.clear();
+        LidarMeasures.lio_vio_flg = WAIT;
+        LidarMeasures.lidar_scan_index_now = 0;
+        LidarMeasures.pcl_proc_cur->clear();
+        lidar_pushed = false;
+        std::cout << "[ Sync ] discard current measurement after IMU propagation failure" << std::endl;
+      }
+      rate.sleep();
+      continue;
+    }
 
-    processImu();
+    handleFirstFrame();
 
     // if (!p_imu->imu_time_init) continue;
 
@@ -594,7 +1042,19 @@ void LIVMapper::run()
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
 {
+  if (!std::isfinite(dt) || dt < 0.0 || dt > 0.2)
+  {
+    std::cout << "[ IMU ] skip imu-rate propagation: invalid dt=" << dt << std::endl;
+    return;
+  }
+  const StatesGroup state_before = imu_prop_state;
   double mean_acc_norm = p_imu->IMU_mean_acc_norm;
+  if (!std::isfinite(mean_acc_norm) || mean_acc_norm < 1e-6)
+  {
+    std::cout << "[ IMU ] skip imu-rate propagation: invalid mean_acc_norm="
+              << mean_acc_norm << std::endl;
+    return;
+  }
   acc_avr = acc_avr * G_m_s2 / mean_acc_norm - imu_prop_state.bias_a;
   angvel_avr -= imu_prop_state.bias_g;
 
@@ -610,6 +1070,13 @@ void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D 
 
   /* velocity of IMU */
   imu_prop_state.vel_end = imu_prop_state.vel_end + acc_imu * dt;
+  if (!imu_prop_state.rot_end.allFinite() ||
+      !imu_prop_state.pos_end.allFinite() ||
+      !imu_prop_state.vel_end.allFinite())
+  {
+    std::cout << "[ IMU ] reject imu-rate propagation: non-finite state" << std::endl;
+    imu_prop_state = state_before;
+  }
 }
 
 void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
@@ -734,15 +1201,33 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
   mtx_buffer.lock();
 
   double cur_head_time = msg->header.stamp.toSec() + lidar_time_offset;
+  if (!std::isfinite(cur_head_time))
+  {
+    ROS_WARN("[ Sync ] discard lidar: non-finite header time");
+    mtx_buffer.unlock();
+    return;
+  }
   // cout<<"got feature"<<endl;
   if (cur_head_time < last_timestamp_lidar)
   {
     ROS_ERROR("lidar loop back, clear buffer");
     lid_raw_data_buffer.clear();
+    lid_header_time_buffer.clear();
   }
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  const size_t removed_invalid = filterFinitePointCloud(ptr);
+  if (removed_invalid > 0)
+  {
+    ROS_WARN("[ Sync ] filtered %zu non-finite lidar points", removed_invalid);
+  }
+  if (!ptr || ptr->empty())
+  {
+    ROS_WARN("[ Sync ] discard lidar: no finite points");
+    mtx_buffer.unlock();
+    return;
+  }
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -770,18 +1255,30 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   }
 
   double cur_head_time = msg->header.stamp.toSec();
+  if (!std::isfinite(cur_head_time))
+  {
+    ROS_WARN("[ Sync ] discard lidar: non-finite header time");
+    mtx_buffer.unlock();
+    return;
+  }
   ROS_INFO("Get LiDAR, its header time: %.6f", cur_head_time);
   if (cur_head_time < last_timestamp_lidar)
   {
     ROS_ERROR("lidar loop back, clear buffer");
     lid_raw_data_buffer.clear();
+    lid_header_time_buffer.clear();
   }
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  const size_t removed_invalid = filterFinitePointCloud(ptr);
+  if (removed_invalid > 0)
+  {
+    ROS_WARN("[ Sync ] filtered %zu non-finite lidar points", removed_invalid);
+  }
 
   if (!ptr || ptr->empty()) {
-    ROS_ERROR("Received an empty point cloud");
+    ROS_ERROR("Received an empty point cloud after finite filtering");
     mtx_buffer.unlock();
     return;
   }
@@ -988,7 +1485,15 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // meas.last_lio_update_time);
 
       double lid_newest_time = lid_header_time_buffer.back() + lid_raw_data_buffer.back()->points.back().curvature / double(1000);
-      double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
+      double imu_newest_time = imu_en ? imu_buffer.back()->header.stamp.toSec() : std::numeric_limits<double>::infinity();
+      if (!std::isfinite(img_capture_time) ||
+          !std::isfinite(lid_newest_time) ||
+          (imu_en && !std::isfinite(imu_newest_time)))
+      {
+        ROS_WARN("[ Sync ] wait: non-finite sync time, img=%.6f lidar=%.6f imu=%.6f",
+                 img_capture_time, lid_newest_time, imu_newest_time);
+        return false;
+      }
 
       if (img_capture_time < meas.last_lio_update_time + 0.00001)
       {
@@ -998,7 +1503,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
         return false;
       }
 
-      if (img_capture_time > lid_newest_time || img_capture_time > imu_newest_time)
+      if (img_capture_time > lid_newest_time || (imu_en && img_capture_time > imu_newest_time))
       {
         // ROS_ERROR("lost first camera frame");
         // printf("img_capture_time, lid_newest_time, imu_newest_time: %lf , %lf
@@ -1076,7 +1581,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       meas.lio_vio_flg = VIO;
       // printf("[ Data Cut ] VIO \n");
       meas.measures.clear();
-      double imu_time = imu_buffer.front()->header.stamp.toSec();
 
       struct MeasureGroup m;
       m.vio_time = img_capture_time;
@@ -1148,7 +1652,28 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
 void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)
 {
-  cv::Mat img_rgb = vio_manager->img_cp;
+  if (vio_manager == nullptr || vio_manager->img_cp.empty()) return;
+
+  cv::Mat img_rgb;
+  if (vio_manager->img_cp.channels() == 1)
+  {
+    cv::cvtColor(vio_manager->img_cp, img_rgb, cv::COLOR_GRAY2BGR);
+  }
+  else if (vio_manager->img_cp.channels() == 4)
+  {
+    cv::cvtColor(vio_manager->img_cp, img_rgb, cv::COLOR_BGRA2BGR);
+  }
+  else if (vio_manager->img_cp.channels() == 3)
+  {
+    img_rgb = vio_manager->img_cp;
+  }
+  else
+  {
+    std::cout << "[ Publish ] skip image: unsupported channels="
+              << vio_manager->img_cp.channels() << std::endl;
+    return;
+  }
+
   cv_bridge::CvImage out_msg;
   out_msg.header.stamp = ros::Time::now();
   // out_msg.header.frame_id = "camera_init";
@@ -1157,35 +1682,94 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
   pubImage.publish(out_msg.toImageMsg());
 }
 
+void LIVMapper::publish_gs_rendered_img(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)
+{
+  if (vio_manager == nullptr || vio_manager->img_rendered.empty()) return;
+
+  cv::Mat img_rendered;
+  if (vio_manager->img_rendered.channels() == 1)
+  {
+    cv::cvtColor(vio_manager->img_rendered, img_rendered, cv::COLOR_GRAY2BGR);
+  }
+  else if (vio_manager->img_rendered.channels() == 4)
+  {
+    cv::cvtColor(vio_manager->img_rendered, img_rendered, cv::COLOR_BGRA2BGR);
+  }
+  else if (vio_manager->img_rendered.channels() == 3)
+  {
+    img_rendered = vio_manager->img_rendered;
+  }
+  else
+  {
+    std::cout << "[ Publish ] skip rendered image: unsupported channels="
+              << vio_manager->img_rendered.channels() << std::endl;
+    return;
+  }
+
+  cv_bridge::CvImage out_msg;
+  out_msg.header.stamp = ros::Time::now();
+  out_msg.encoding = sensor_msgs::image_encodings::BGR8;
+  out_msg.image = img_rendered;
+  pubImage.publish(out_msg.toImageMsg());
+}
+
 void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager)
 {
+  if (pcl_w_wait_pub == nullptr || pcl_w_wait_pub->empty()) return;
+
+  const size_t removed_invalid_current = filterFinitePointCloud(pcl_w_wait_pub);
+  if (removed_invalid_current > 0)
+  {
+    std::cout << "[ Publish ] filtered " << removed_invalid_current
+              << " non-finite current frame points" << std::endl;
+  }
   if (pcl_w_wait_pub->empty()) return;
+
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
+  bool should_publish = true;
+  bool flushed_accumulated_cloud = false;
   if (img_en)
   {
     static int pub_num = 1;
     *pcl_wait_pub += *pcl_w_wait_pub;
-    if(pub_num == pub_scan_num)
+    filterFinitePointCloud(pcl_wait_pub);
+    const int publish_every = std::max(1, pub_scan_num);
+    if(pub_num >= publish_every)
     {
       pub_num = 1;
+      flushed_accumulated_cloud = true;
       size_t size = pcl_wait_pub->points.size();
       laserCloudWorldRGB->reserve(size);
       // double inv_expo = _state.inv_expo_time;
-      cv::Mat img_rgb = vio_manager->img_rgb;
+      if (vio_manager == nullptr || vio_manager->new_frame_ == nullptr ||
+          vio_manager->img_rgb.empty() || !isFiniteMappingState(_state))
+      {
+        std::cout << "[ Publish ] skip colored cloud: invalid visual context" << std::endl;
+        should_publish = false;
+      }
+      cv::Mat img_rgb = should_publish ? vio_manager->img_rgb : cv::Mat();
       for (size_t i = 0; i < size; i++)
       {
+        if (!should_publish) break;
+        if (!isFinitePointForMapping(pcl_wait_pub->points[i])) continue;
+
         PointTypeRGB pointRGB;
         pointRGB.x = pcl_wait_pub->points[i].x;
         pointRGB.y = pcl_wait_pub->points[i].y;
         pointRGB.z = pcl_wait_pub->points[i].z;
 
         V3D p_w(pcl_wait_pub->points[i].x, pcl_wait_pub->points[i].y, pcl_wait_pub->points[i].z);
-        V3D pf(vio_manager->new_frame_->w2f(p_w)); if (pf[2] < 0) continue;
+        V3D pf(vio_manager->new_frame_->w2f(p_w));
+        if (!pf.allFinite() || pf[2] <= 0) continue;
         V2D pc(vio_manager->new_frame_->w2c(p_w));
 
-        if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) // 100
+        if (pc.allFinite() &&
+            vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3) &&
+            pc[0] >= 0.0 && pc[1] >= 0.0 &&
+            pc[0] < img_rgb.cols - 1 && pc[1] < img_rgb.rows - 1) // 100
         {
           V3F pixel = vio_manager->getInterpolatedPixel(img_rgb, pc);
+          if (!pixel.allFinite()) continue;
           pointRGB.r = pixel[2];
           pointRGB.g = pixel[1];
           pointRGB.b = pixel[0];
@@ -1196,35 +1780,45 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           // else if (pointRGB.g < 0) pointRGB.g = 0;
           // if (pointRGB.b > 255) pointRGB.b = 255;
           // else if (pointRGB.b < 0) pointRGB.b = 0;
-          if (pf.norm() > blind_rgb_points) laserCloudWorldRGB->push_back(pointRGB);
+          const double pf_norm = pf.norm();
+          if (std::isfinite(pf_norm) && pf_norm > blind_rgb_points) laserCloudWorldRGB->push_back(pointRGB);
         }
+      }
+      should_publish = should_publish && !laserCloudWorldRGB->empty();
+      if (!should_publish && laserCloudWorldRGB->empty())
+      {
+        std::cout << "[ Publish ] skip colored cloud: no finite in-frame RGB points" << std::endl;
       }
     }
     else
     {
       pub_num++;
+      should_publish = false;
     }
   }
 
   /*** Publish Frame ***/
-  sensor_msgs::PointCloud2 laserCloudmsg;
-  if (img_en)
+  if (should_publish)
   {
-    // cout << "RGB pointcloud size: " << laserCloudWorldRGB->size() << endl;
-    pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
+    sensor_msgs::PointCloud2 laserCloudmsg;
+    if (img_en)
+    {
+      // cout << "RGB pointcloud size: " << laserCloudWorldRGB->size() << endl;
+      pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
+    }
+    else
+    {
+      pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg);
+    }
+    laserCloudmsg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
+    laserCloudmsg.header.frame_id = "camera_init";
+    pubLaserCloudFullRes.publish(laserCloudmsg);
   }
-  else 
-  { 
-    pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg); 
-  }
-  laserCloudmsg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
-  laserCloudmsg.header.frame_id = "camera_init";
-  pubLaserCloudFullRes.publish(laserCloudmsg);
 
   /**************** save map ****************/
   /* 1. make sure you have enough memories
   /* 2. noted that pcd save will influence the real-time performences **/
-  if (pcd_save_en)
+  if (pcd_save_en && should_publish)
   {
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
@@ -1265,7 +1859,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       }
     }
   }
-  if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
+  if(flushed_accumulated_cloud) PointCloudXYZI().swap(*pcl_wait_pub);
   PointCloudXYZI().swap(*pcl_w_wait_pub);
 }
 

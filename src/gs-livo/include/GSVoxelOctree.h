@@ -114,23 +114,13 @@ public:
     else
     {
       // 已经切割到了 叶子节点
-      if(gs_points_.size() < 1)
+      if(gs_points_.empty())
       {
-
-
-        if(root_voxel_->leaf_node_list.size()<1)
-        {
-
-        pv->index = -1;
-
-        gs_points_.push_back(pv);
         root_voxel_->leaf_node_list.push_back(this);
-
-        }
-
-
-
       }
+
+      pv->index = -1;
+      gs_points_.push_back(pv);
     }
   }
 };

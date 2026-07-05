@@ -12,6 +12,30 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 
+#include <cmath>
+
+namespace
+{
+constexpr double kMaxImuPropagationDt = 0.2;
+
+bool stateIsFinite(const StatesGroup &state)
+{
+  return state.rot_end.allFinite() &&
+         state.pos_end.allFinite() &&
+         state.vel_end.allFinite() &&
+         state.bias_g.allFinite() &&
+         state.bias_a.allFinite() &&
+         state.gravity.allFinite() &&
+         state.cov.allFinite() &&
+         std::isfinite(state.inv_expo_time);
+}
+
+bool propagationDtIsValid(double dt)
+{
+  return std::isfinite(dt) && dt >= 0.0 && dt <= kMaxImuPropagationDt;
+}
+} // namespace
+
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
                            Zero3d(0, 0, 0), b_first_frame(true), imu_need_init(true)
 {
@@ -21,12 +45,15 @@ ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
   cov_bias_gyr = V3D(0.1, 0.1, 0.1);
   cov_bias_acc = V3D(0.1, 0.1, 0.1);
   cov_inv_expo = 0.2;
+  IMU_mean_acc_norm = 1.0;
   mean_acc = V3D(0, 0, -1.0);
   mean_gyr = V3D(0, 0, 0);
   angvel_last = Zero3d;
   acc_s_last = Zero3d;
   Lid_offset_to_IMU = Zero3d;
   Lid_rot_to_IMU = Eye3d;
+  last_prop_end_time = -1.0;
+  time_last_scan = -1.0;
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
 }
@@ -38,9 +65,12 @@ void ImuProcess::Reset()
   ROS_WARN("Reset ImuProcess");
   mean_acc = V3D(0, 0, -1.0);
   mean_gyr = V3D(0, 0, 0);
+  IMU_mean_acc_norm = 1.0;
   angvel_last = Zero3d;
   imu_need_init = true;
   init_iter_num = 1;
+  last_prop_end_time = -1.0;
+  time_last_scan = -1.0;
   IMUpose.clear();
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
@@ -101,12 +131,32 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
 
 void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num; }
 
-void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
+bool ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
+  if (meas.imu.empty())
+  {
+    ROS_WARN("[ IMU ] skip initialization: empty imu packet");
+    return false;
+  }
+
+  const StatesGroup state_at_entry = state_inout;
   ROS_INFO("IMU Initializing: %.1f %%", double(N) / MAX_INI_COUNT * 100);
   V3D cur_acc, cur_gyr;
+  for (const auto &imu : meas.imu)
+  {
+    const auto &imu_acc = imu->linear_acceleration;
+    const auto &gyr_acc = imu->angular_velocity;
+    cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
+    cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+    if (!cur_acc.allFinite() || !cur_gyr.allFinite())
+    {
+      ROS_WARN("[ IMU ] skip initialization: non-finite imu sample");
+      state_inout = state_at_entry;
+      return false;
+    }
+  }
 
   if (b_first_frame)
   {
@@ -141,20 +191,51 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     N++;
   }
   IMU_mean_acc_norm = mean_acc.norm();
-  state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
+  if (!std::isfinite(IMU_mean_acc_norm) || IMU_mean_acc_norm < 1e-6 || !mean_gyr.allFinite())
+  {
+    ROS_WARN("[ IMU ] skip initialization: invalid mean acc norm %.6f", IMU_mean_acc_norm);
+    state_inout = state_at_entry;
+    return false;
+  }
+
+  state_inout.gravity = -mean_acc / IMU_mean_acc_norm * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   state_inout.bias_g = Zero3d; // mean_gyr;
+  if (!stateIsFinite(state_inout))
+  {
+    ROS_WARN("[ IMU ] skip initialization: non-finite initialized state");
+    state_inout = state_at_entry;
+    return false;
+  }
 
   last_imu = meas.imu.back();
+  return true;
 }
 
 void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out)
 {
+  last_propagation_success_ = false;
+  const StatesGroup state_at_entry = state_inout;
   pcl_out = *(meas.lidar);
+  if (pcl_out.empty())
+  {
+    ROS_WARN("[ IMU ] skip no-IMU propagation: empty lidar cloud");
+    state_inout = state_at_entry;
+    return;
+  }
   /*** sort point clouds by offset time ***/
   const double &pcl_beg_time = meas.lidar_frame_beg_time;
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
   const double &pcl_end_time = pcl_beg_time + pcl_out.points.back().curvature / double(1000);
+  if (!std::isfinite(pcl_beg_time) ||
+      !std::isfinite(pcl_out.points.back().curvature) ||
+      !std::isfinite(pcl_end_time))
+  {
+    ROS_WARN("[ IMU ] skip no-IMU propagation: non-finite lidar timing");
+    state_inout = state_at_entry;
+    pcl_out.clear();
+    return;
+  }
   meas.last_lio_update_time = pcl_end_time;
   const double &pcl_end_offset_time = pcl_out.points.back().curvature / double(1000);
 
@@ -166,9 +247,22 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
     dt = 0.1;
     b_first_frame = false;
   }
-  else { dt = pcl_beg_time - time_last_scan; }
+  else if (std::isfinite(time_last_scan) && time_last_scan >= 0.0)
+  {
+    dt = pcl_beg_time - time_last_scan;
+  }
+  else
+  {
+    dt = 0.0;
+  }
 
   time_last_scan = pcl_beg_time;
+  if (!propagationDtIsValid(dt))
+  {
+    ROS_WARN("[ IMU ] skip no-IMU propagation: invalid dt %.6f", dt);
+    state_inout = state_at_entry;
+    return;
+  }
   // for (size_t i = 0; i < pcl_out->points.size(); i++) {
   //   if (dt < pcl_out->points[i].curvature) {
   //     dt = pcl_out->points[i].curvature;
@@ -181,6 +275,13 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
   /* covariance propagation */
   // M3D acc_avr_skew;
   M3D Exp_f = Exp(state_inout.bias_g, dt);
+  if (!Exp_f.allFinite())
+  {
+    ROS_WARN("[ IMU ] skip no-IMU propagation: non-finite rotation increment");
+    state_inout = state_at_entry;
+    pcl_out.clear();
+    return;
+  }
 
   F_x.setIdentity();
   cov_w.setZero();
@@ -194,6 +295,13 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
 
   cov_w.block<3, 3>(10, 10).diagonal() = cov_gyr * dt * dt; // for omega in constant model
   cov_w.block<3, 3>(7, 7).diagonal() = cov_acc * dt * dt; // for velocity in constant model
+  if (!F_x.allFinite() || !cov_w.allFinite())
+  {
+    ROS_WARN("[ IMU ] skip no-IMU propagation: non-finite covariance model");
+    state_inout = state_at_entry;
+    pcl_out.clear();
+    return;
+  }
   // cov_w.block<3, 3>(6, 6) =
   //     R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt * dt;
   // cov_w.block<3, 3>(9, 9).diagonal() =
@@ -209,6 +317,13 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
   //           << std::endl;
   state_inout.rot_end = state_inout.rot_end * Exp_f;
   state_inout.pos_end = state_inout.pos_end + state_inout.vel_end * dt;
+  if (!stateIsFinite(state_inout))
+  {
+    ROS_WARN("[ IMU ] skip no-IMU propagation: non-finite state");
+    state_inout = state_at_entry;
+    pcl_out.clear();
+    return;
+  }
 
   if (lidar_type != L515)
   {
@@ -219,23 +334,40 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
         dt_j= pcl_end_offset_time - it_pcl->curvature/double(1000);
         M3D R_jk(Exp(state_inout.bias_g, - dt_j));
         V3D P_j(it_pcl->x, it_pcl->y, it_pcl->z);
+        if (!std::isfinite(dt_j) || !R_jk.allFinite() || !P_j.allFinite())
+        {
+          ROS_WARN("[ IMU ] skip no-IMU propagation: invalid point compensation input");
+          state_inout = state_at_entry;
+          pcl_out.clear();
+          return;
+        }
         // Using rotation and translation to un-distort points
         V3D p_jk;
         p_jk = - state_inout.rot_end.transpose() * state_inout.vel_end * dt_j;
-  
+
         V3D P_compensate =  R_jk * P_j + p_jk;
-  
+        if (!P_compensate.allFinite())
+        {
+          ROS_WARN("[ IMU ] skip no-IMU propagation: non-finite compensated point");
+          state_inout = state_at_entry;
+          pcl_out.clear();
+          return;
+        }
+
         /// save Undistorted points and their rotation
         it_pcl->x = P_compensate(0);
         it_pcl->y = P_compensate(1);
         it_pcl->z = P_compensate(2);
     }
   }
+  last_propagation_success_ = true;
 }
 
 
 void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out)
 {
+  last_propagation_success_ = false;
+  const StatesGroup state_at_entry = state_inout;
   double t0 = omp_get_wtime();
   pcl_out.clear();
   /*** add the imu of the last frame-tail to the of current frame-head ***/
@@ -245,12 +377,31 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   v_imu.push_front(last_imu);
   const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
   const double &imu_end_time = v_imu.back()->header.stamp.toSec();
-  const double prop_beg_time = last_prop_end_time;
+  const double prop_beg_time =
+      (std::isfinite(last_prop_end_time) && last_prop_end_time >= 0.0)
+          ? last_prop_end_time
+          : lidar_meas.last_lio_update_time;
   // printf("[ IMU ] undistort input size: %zu \n", lidar_meas.pcl_proc_cur->points.size());
   // printf("[ IMU ] IMU data sequence size: %zu \n", meas.imu.size());
   // printf("[ IMU ] lidar_scan_index_now: %d \n", lidar_meas.lidar_scan_index_now);
 
   const double prop_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
+  if (!std::isfinite(prop_beg_time) || !std::isfinite(prop_end_time) ||
+      prop_end_time + 1e-6 < prop_beg_time ||
+      prop_end_time - prop_beg_time > kMaxImuPropagationDt)
+  {
+    ROS_WARN("[ IMU ] skip propagation: invalid propagation window [%.6f, %.6f]",
+             prop_beg_time, prop_end_time);
+    state_inout = state_at_entry;
+    return;
+  }
+  if (meas.imu.empty() && prop_end_time > prop_beg_time + 1e-6)
+  {
+    ROS_WARN("[ IMU ] skip propagation: no imu samples for non-zero window [%.6f, %.6f]",
+             prop_beg_time, prop_end_time);
+    state_inout = state_at_entry;
+    return;
+  }
 
   /*** cut lidar point based on the propagation-start time and required
    * propagation-end time ***/
@@ -339,6 +490,13 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
 
       acc_avr << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x), 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
           0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+      if (!angvel_avr.allFinite() || !acc_avr.allFinite())
+      {
+        ROS_WARN("[ IMU ] skip propagation: non-finite imu sample");
+        state_inout = state_at_entry;
+        pcl_out.clear();
+        return;
+      }
 
       // cout<<"angvel_avr: "<<angvel_avr.transpose()<<endl;
       // cout<<"acc_avr: "<<acc_avr.transpose()<<endl;
@@ -350,12 +508,19 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // imu_time = head->header.stamp.toSec() - first_lidar_time;
 
       angvel_avr -= state_inout.bias_g;
-      acc_avr = acc_avr * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
+      const double mean_acc_norm = mean_acc.norm();
+      if (!std::isfinite(mean_acc_norm) || mean_acc_norm < 1e-6)
+      {
+        ROS_WARN("[ IMU ] skip propagation: invalid mean acceleration norm %.6f", mean_acc_norm);
+        state_inout = state_at_entry;
+        return;
+      }
+      acc_avr = acc_avr * G_m_s2 / mean_acc_norm - state_inout.bias_a;
 
       if (head->header.stamp.toSec() < prop_beg_time)
       {
         // printf("00 \n");
-        dt = tail->header.stamp.toSec() - last_prop_end_time;
+        dt = tail->header.stamp.toSec() - prop_beg_time;
         offs_t = tail->header.stamp.toSec() - prop_beg_time;
       }
       else if (i != v_imu.size() - 2)
@@ -371,12 +536,25 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         offs_t = prop_end_time - prop_beg_time;
       }
 
+      if (!propagationDtIsValid(dt))
+      {
+        ROS_WARN("[ IMU ] skip propagation: invalid dt %.6f", dt);
+        state_inout = state_at_entry;
+        return;
+      }
       dt_all += dt;
       // printf("[ LIO Propagation ] dt: %lf \n", dt);
 
       /* covariance propagation */
       M3D acc_avr_skew;
       M3D Exp_f = Exp(angvel_avr, dt);
+      if (!Exp_f.allFinite())
+      {
+        ROS_WARN("[ IMU ] skip propagation: non-finite rotation increment");
+        state_inout = state_at_entry;
+        pcl_out.clear();
+        return;
+      }
       acc_avr_skew << SKEW_SYM_MATRX(acc_avr);
 
       F_x.setIdentity();
@@ -397,8 +575,21 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       cov_w.block<3, 3>(7, 7) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt * dt;
       cov_w.block<3, 3>(10, 10).diagonal() = cov_bias_gyr * dt * dt; // bias gyro covariance
       cov_w.block<3, 3>(13, 13).diagonal() = cov_bias_acc * dt * dt; // bias acc covariance
+      if (!F_x.allFinite() || !cov_w.allFinite())
+      {
+        ROS_WARN("[ IMU ] skip propagation: non-finite covariance model");
+        state_inout = state_at_entry;
+        pcl_out.clear();
+        return;
+      }
 
       state_inout.cov = F_x * state_inout.cov * F_x.transpose() + cov_w;
+      if (!state_inout.cov.allFinite())
+      {
+        ROS_WARN("[ IMU ] skip propagation: non-finite covariance");
+        state_inout = state_at_entry;
+        return;
+      }
       // state_inout.cov.block<18,18>(0,0) = F_x.block<18,18>(0,0) *
       // state_inout.cov.block<18,18>(0,0) * F_x.block<18,18>(0,0).transpose() +
       // cov_w.block<18,18>(0,0);
@@ -419,6 +610,12 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
 
       /* velocity of IMU */
       vel_imu = vel_imu + acc_imu * dt;
+      if (!R_imu.allFinite() || !pos_imu.allFinite() || !vel_imu.allFinite())
+      {
+        ROS_WARN("[ IMU ] skip propagation: non-finite propagated pose");
+        state_inout = state_at_entry;
+        return;
+      }
 
       /* save the poses at each IMU measurements */
       angvel_last = angvel_avr;
@@ -442,6 +639,13 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   state_inout.rot_end = R_imu;
   state_inout.pos_end = pos_imu;
   state_inout.inv_expo_time = tau;
+  if (!stateIsFinite(state_inout))
+  {
+    ROS_WARN("[ IMU ] skip propagation: non-finite final state");
+    state_inout = state_at_entry;
+    pcl_out.clear();
+    return;
+  }
 
   /*** calculated the pos and attitude prediction at the frame-end ***/
   // if (imu_end_time>prop_beg_time)
@@ -468,6 +672,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
 
   last_imu = v_imu.back();
   last_prop_end_time = prop_end_time;
+  last_propagation_success_ = true;
 
   double t1 = omp_get_wtime();
 
@@ -514,6 +719,16 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       for (; it_pcl->curvature / double(1000) > head->offset_time; it_pcl--)
       {
         dt = it_pcl->curvature / double(1000) - head->offset_time;
+        if (!propagationDtIsValid(dt))
+        {
+          ROS_WARN("[ IMU ] skip undistortion: invalid point dt %.6f", dt);
+          last_propagation_success_ = false;
+          state_inout = state_at_entry;
+          pcl_out.clear();
+          pcl_wait_proc.clear();
+          IMUpose.clear();
+          return;
+        }
 
         /* Transform to the 'end' frame */
         M3D R_i(R_imu * Exp(angvel_avr, dt));
@@ -524,6 +739,16 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         // (state_inout.rot_end.transpose() * (R_i * (Lid_rot_to_IMU * P_i +
         // Lid_offset_to_IMU) + T_ei) - Lid_offset_to_IMU);
         V3D P_compensate = (extR_Ri * (R_i * (Lid_rot_to_IMU * P_i + Lid_offset_to_IMU) + T_ei) - exrR_extT);
+        if (!P_compensate.allFinite())
+        {
+          ROS_WARN("[ IMU ] skip undistortion: non-finite compensated point");
+          last_propagation_success_ = false;
+          state_inout = state_at_entry;
+          pcl_out.clear();
+          pcl_wait_proc.clear();
+          IMUpose.clear();
+          return;
+        }
 
         /// save Undistorted points and their rotation
         it_pcl->x = P_compensate(0);
@@ -542,6 +767,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
 
 void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_)
 {
+  last_propagation_success_ = false;
   double t1, t2, t3;
   t1 = omp_get_wtime();
   ROS_ASSERT(lidar_meas.lidar != nullptr);
@@ -556,15 +782,21 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
   if (imu_need_init)
   {
     double pcl_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
-    // lidar_meas.last_lio_update_time = pcl_end_time;
+    if (!std::isfinite(pcl_end_time))
+    {
+      ROS_WARN("[ IMU ] skip initialization: invalid packet end time %.6f", pcl_end_time);
+      return;
+    }
 
     if (meas.imu.empty()) { return; };
     /// The very first lidar frame
-    IMU_init(meas, stat, init_iter_num);
+    if (!IMU_init(meas, stat, init_iter_num)) { return; }
 
     imu_need_init = true;
 
     last_imu = meas.imu.back();
+    lidar_meas.last_lio_update_time = pcl_end_time;
+    last_prop_end_time = pcl_end_time;
 
     if (init_iter_num > MAX_INI_COUNT)
     {

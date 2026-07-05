@@ -1,121 +1,98 @@
-cmake_minimum_required(VERSION 2.8.3)
-project(fast_livo CUDA CXX)
+cmake_minimum_required(VERSION 3.16)
+project(fast_livo LANGUAGES CUDA CXX)
 
-find_package(CUDA REQUIRED)
-if(NOT CUDA_FOUND)
-  message(FATAL_ERROR "CUDA not found! Install CUDA Toolkit.")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
 endif()
-include_directories(${CUDA_INCLUDE_DIRS})
-message(STATUS "CUDA_INCLUDE_DIRS: ${CUDA_INCLUDE_DIRS}")
-
-set(CMAKE_BUILD_TYPE "Release")
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
-
-# set(CMAKE_CUDA_COMPILER /usr/local/cuda-11.8/bin/nvcc)
-
-set(PYTHON_EXECUTABLE /usr/bin/python3)
-find_package(PythonLibs REQUIRED)
-
-set(LIBTORCH_DIR "./libtorch")
-set(LIBTORCH_INCLUDE_DIR "${LIBTORCH_DIR}/include/torch/csrc/api/include")
-
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-# Set common compile options
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions")
-
-# Specific settings for Debug build
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fPIC")
 
-# Detect CPU architecture
+find_package(CUDA REQUIRED)
+if(NOT CUDA_FOUND)
+  message(FATAL_ERROR "CUDA not found. Install CUDA Toolkit before building GS-LIVO.")
+endif()
+include_directories(${CUDA_INCLUDE_DIRS})
+message(STATUS "CUDA_INCLUDE_DIRS: ${CUDA_INCLUDE_DIRS}")
+
+set(PYTHON_EXECUTABLE /usr/bin/python3 CACHE FILEPATH "Python executable used by catkin")
+find_package(PythonLibs REQUIRED)
+
+get_filename_component(GS_LIVO_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+set(GS_LIVO_LIBTORCH_DIR "" CACHE PATH "Path to a libtorch or Python torch installation prefix")
+if(GS_LIVO_LIBTORCH_DIR)
+  list(APPEND CMAKE_PREFIX_PATH "${GS_LIVO_LIBTORCH_DIR}")
+  if(EXISTS "${GS_LIVO_LIBTORCH_DIR}/share/cmake/Torch/TorchConfig.cmake")
+    set(Torch_DIR "${GS_LIVO_LIBTORCH_DIR}/share/cmake/Torch" CACHE PATH "Torch CMake package directory" FORCE)
+  elseif(EXISTS "${GS_LIVO_LIBTORCH_DIR}/torch/share/cmake/Torch/TorchConfig.cmake")
+    set(Torch_DIR "${GS_LIVO_LIBTORCH_DIR}/torch/share/cmake/Torch" CACHE PATH "Torch CMake package directory" FORCE)
+  endif()
+endif()
+
+if(NOT Torch_DIR)
+  execute_process(
+    COMMAND "${PYTHON_EXECUTABLE}" -c "import torch, sys; sys.stdout.write(torch.utils.cmake_prefix_path)"
+    RESULT_VARIABLE _torch_python_result
+    OUTPUT_VARIABLE _torch_python_prefix
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  if(_torch_python_result EQUAL 0 AND _torch_python_prefix)
+    list(APPEND CMAKE_PREFIX_PATH "${_torch_python_prefix}")
+    message(STATUS "Using Torch CMake prefix from Python: ${_torch_python_prefix}")
+  endif()
+endif()
+
+find_package(Torch REQUIRED)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+
 message(STATUS "Current CPU architecture: ${CMAKE_SYSTEM_PROCESSOR}")
-
-# Specific settings for Release build
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64|ARM|AARCH64)")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    # 64-bit ARM optimizations (e.g., RK3588 and Jetson Orin NX)
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -mcpu=native -mtune=native -ffast-math")
-    message(STATUS "Using 64-bit ARM optimizations: -O3 -mcpu=native -mtune=native -ffast-math")
+    message(STATUS "Using 64-bit ARM optimizations")
   else()
-    # 32-bit ARM optimizations with NEON support
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -mcpu=native -mtune=native -mfpu=neon -ffast-math")
-    message(STATUS "Using 32-bit ARM optimizations: -O3 -mcpu=native -mtune=native -mfpu=neon -ffast-math")
+    message(STATUS "Using 32-bit ARM optimizations")
   endif()
   add_definitions(-DARM_ARCH)
 else()
-  # x86-64 (Intel/AMD) optimizations
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -mtune=native -funroll-loops") #-flto
-  message(STATUS "Using general x86 optimizations: -O3 -march=native -mtune=native -funroll-loops") 
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -mtune=native -funroll-loops")
+  message(STATUS "Using x86 optimizations")
   add_definitions(-DX86_ARCH)
 endif()
 
-# Define project root directory
 add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
 
-# Detect CPU core count for potential multithreading optimization
 include(ProcessorCount)
 ProcessorCount(N)
 message(STATUS "Processor count: ${N}")
-
-# Set the number of cores for multithreading
 if(N GREATER 4)
-  math(EXPR PROC_NUM "4")
+  set(PROC_NUM 4)
   add_definitions(-DMP_EN -DMP_PROC_NUM=${PROC_NUM})
-  message(STATUS "Multithreading enabled. Cores: ${PROC_NUM}")
 elseif(N GREATER 1)
-  math(EXPR PROC_NUM "${N}")
+  set(PROC_NUM ${N})
   add_definitions(-DMP_EN -DMP_PROC_NUM=${PROC_NUM})
-  message(STATUS "Multithreading enabled. Cores: ${PROC_NUM}")
 else()
+  set(PROC_NUM 1)
   add_definitions(-DMP_PROC_NUM=1)
-  message(STATUS "Single core detected. Multithreading disabled.")
 endif()
+message(STATUS "Mapping threads: ${PROC_NUM}")
 
-set(PYTHON_EXECUTABLE /usr/bin/python3)
-
-
-set(SIMPLE_KNN_DIR "/usr/local") 
-include_directories(${SIMPLE_KNN_DIR}/include/simple-knn/)
-link_directories(${SIMPLE_KNN_DIR}/lib)
-
-
-set(LIBTORCH_DIR "./libtorch")
-include_directories(${LIBTORCH_DIR}/include)
-link_directories(${LIBTORCH_DIR}/lib)
-
-set(Torch_DIR "${LIBTORCH_DIR}/share/cmake/Torch")
-find_package(Torch REQUIRED)
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")  # 添加Torch标志
-include_directories(${TORCH_INCLUDE_DIRS})
-
-include_directories(
-	${catkin_INCLUDE_DIRS} 
-  ${EIGEN3_INCLUDE_DIR}
-  ${PCL_INCLUDE_DIRS}
-  ${PYTHON_INCLUDE_DIRS}
-  ${OpenCV_INCLUDE_DIRS}
-  ${Sophus_INCLUDE_DIRS}
-  #${JSONCPP_LIBRARIES}
-  include)
-
-
-find_package(PythonLibs REQUIRED)
-
-add_subdirectory(rpg_vikit)
-# Check for OpenMP support
 find_package(OpenMP QUIET)
 if(OpenMP_CXX_FOUND)
   message(STATUS "OpenMP found")
   add_compile_options(${OpenMP_CXX_FLAGS})
-else()
-  message(STATUS "OpenMP not found, proceeding without it")
 endif()
 
-# Check for mimalloc support
 find_package(mimalloc QUIET)
 if(mimalloc_FOUND)
   message(STATUS "mimalloc found")
@@ -123,7 +100,6 @@ else()
   message(STATUS "mimalloc not found, proceeding without it")
 endif()
 
-# Find catkin and required dependencies
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   nav_msgs
@@ -146,52 +122,60 @@ find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
+find_library(Sophus_LIBRARY NAMES Sophus libSophus PATHS /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+if(Sophus_LIBRARY)
+  set(Sophus_LIBRARIES ${Sophus_LIBRARY})
+elseif(TARGET Sophus::Sophus)
+  set(Sophus_LIBRARIES Sophus::Sophus)
+endif()
 
-set(Sophus_LIBRARIES libSophus.so)
+set(GS_LIVO_LIB3DGS_DIR "${GS_LIVO_SOURCE_ROOT}/lib3dgs" CACHE PATH "Path to the bundled lib3dgs source")
+if(NOT EXISTS "${GS_LIVO_LIB3DGS_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR "lib3dgs source not found at ${GS_LIVO_LIB3DGS_DIR}")
+endif()
+if(NOT TARGET 3dgs_lib)
+  add_subdirectory("${GS_LIVO_LIB3DGS_DIR}" "${CMAKE_BINARY_DIR}/lib3dgs")
+endif()
 
-# Define the catkin package
 catkin_package(
   CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime cv_bridge vikit_common vikit_ros image_transport
   DEPENDS EIGEN3 PCL OpenCV Sophus
 )
 
-# Include directories for dependencies
 include_directories(
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${Sophus_INCLUDE_DIRS}
+  ${PYTHON_INCLUDE_DIRS}
+  ${TORCH_INCLUDE_DIRS}
+  ${GS_LIVO_LIB3DGS_DIR}/includes
+  ${GS_LIVO_LIB3DGS_DIR}/cuda_rasterizer
+  ${GS_LIVO_SOURCE_ROOT}/simple-knn
+  ${GS_LIVO_SOURCE_ROOT}/tinyply/source
+  ${GS_LIVO_SOURCE_ROOT}/json/include
+  ${GS_LIVO_SOURCE_ROOT}/glm
+  ${GS_LIVO_SOURCE_ROOT}/eigen
   include
 )
 
-# Add libraries
 add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
-
-target_link_libraries(vio
-  /home/sheng/02GS_LIVO/lib3dgs/build/lib3dgs_lib.so
-  # ${TORCH_LIBRARIES}
-  # tinyply
-  # simple-knn
+target_include_directories(vio PUBLIC
+  ${GS_LIVO_LIB3DGS_DIR}/includes
+  ${GS_LIVO_LIB3DGS_DIR}/cuda_rasterizer
+  ${GS_LIVO_SOURCE_ROOT}/simple-knn
+  ${GS_LIVO_SOURCE_ROOT}/tinyply/source
 )
-
-target_include_directories(vio PUBLIC   
-${CMAKE_SOURCE_DIR}/3dgs/includes 
-${CMAKE_SOURCE_DIR}/3dgs/cuda_rasterizer 
-${CMAKE_SOURCE_DIR}/3dgs/external/tinyply/source
-${LIBTORCH_INCLUDE_DIR}
-)
-
+target_link_libraries(vio PUBLIC 3dgs_lib ${Sophus_LIBRARIES} ${TORCH_LIBRARIES})
 
 add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
+target_link_libraries(laser_mapping PUBLIC 3dgs_lib ${Sophus_LIBRARIES} ${TORCH_LIBRARIES})
 
-# Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
-
-# Link libraries to the executable
 target_link_libraries(fastlivo_mapping
   laser_mapping
   vio
@@ -203,12 +187,13 @@ target_link_libraries(fastlivo_mapping
   ${OpenCV_LIBRARIES}
   ${Sophus_LIBRARIES}
   ${Boost_LIBRARIES}
-  ${TORCH_LIBRARIES}  # 添加
+  ${TORCH_LIBRARIES}
 )
 
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(fastlivo_mapping OpenMP::OpenMP_CXX)
+endif()
 
-
-# Link mimalloc if found
 if(mimalloc_FOUND)
   target_link_libraries(fastlivo_mapping mimalloc)
 endif()

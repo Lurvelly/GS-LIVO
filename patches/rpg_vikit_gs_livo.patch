@@ -1,0 +1,68 @@
+diff --git a/vikit_common/CMakeLists.txt b/vikit_common/CMakeLists.txt
+index 3e8e8b7..bc90c8a 100644
+--- a/vikit_common/CMakeLists.txt
++++ b/vikit_common/CMakeLists.txt
+@@ -31,6 +31,15 @@ SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -fsee -fomit-frame-pointer
+ FIND_PACKAGE(OpenCV REQUIRED)
+ FIND_PACKAGE(Eigen REQUIRED)
+ FIND_PACKAGE(Sophus REQUIRED)
++find_library(Sophus_LIBRARY NAMES Sophus libSophus PATHS /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
++if(Sophus_LIBRARY)
++  set(Sophus_LIBRARIES ${Sophus_LIBRARY})
++elseif(TARGET Sophus::Sophus)
++  set(Sophus_LIBRARIES Sophus::Sophus)
++endif()
++if(TARGET Sophus::Sophus)
++  get_target_property(Sophus_INCLUDE_DIRS Sophus::Sophus INTERFACE_INCLUDE_DIRECTORIES)
++endif()
+ 
+ # Include dirs
+ INCLUDE_DIRECTORIES(
+@@ -79,15 +88,18 @@ IF(USE_ROS)
+   TARGET_LINK_LIBRARIES(${PROJECT_NAME} ${catkin_LIBRARIES})
+ ENDIF()
+ 
+-# Tests
+-ADD_EXECUTABLE(test_vk_common_camera test/test_camera.cpp)
+-TARGET_LINK_LIBRARIES(test_vk_common_camera ${PROJECT_NAME})
+-
+-ADD_EXECUTABLE(test_vk_common_triangulation test/test_triangulation.cpp)
+-TARGET_LINK_LIBRARIES(test_vk_common_triangulation ${PROJECT_NAME})
+-
+-ADD_EXECUTABLE(test_vk_common_patch_score test/test_patch_score.cpp)
+-TARGET_LINK_LIBRARIES(test_vk_common_patch_score ${PROJECT_NAME})
++# Tests are disabled by default because GS-LIVO only needs the vikit libraries.
++option(VIKIT_BUILD_TESTS "Build vikit test executables" OFF)
++if(VIKIT_BUILD_TESTS)
++  ADD_EXECUTABLE(test_vk_common_camera test/test_camera.cpp)
++  TARGET_LINK_LIBRARIES(test_vk_common_camera ${PROJECT_NAME})
++
++  ADD_EXECUTABLE(test_vk_common_triangulation test/test_triangulation.cpp)
++  TARGET_LINK_LIBRARIES(test_vk_common_triangulation ${PROJECT_NAME})
++
++  ADD_EXECUTABLE(test_vk_common_patch_score test/test_patch_score.cpp)
++  TARGET_LINK_LIBRARIES(test_vk_common_patch_score ${PROJECT_NAME})
++endif()
+ 
+ 
+ ################################################################################
+diff --git a/vikit_ros/CMakeLists.txt b/vikit_ros/CMakeLists.txt
+index 3d4c10b..6ec00e7 100644
+--- a/vikit_ros/CMakeLists.txt
++++ b/vikit_ros/CMakeLists.txt
+@@ -20,6 +20,15 @@ FIND_PACKAGE(catkin REQUIRED COMPONENTS roscpp vikit_common visualization_msgs t
+ FIND_PACKAGE(OpenCV REQUIRED)
+ find_package(Eigen3 REQUIRED)
+ FIND_PACKAGE(Sophus REQUIRED)
++find_library(Sophus_LIBRARY NAMES Sophus libSophus PATHS /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
++if(Sophus_LIBRARY)
++  set(Sophus_LIBRARIES ${Sophus_LIBRARY})
++elseif(TARGET Sophus::Sophus)
++  set(Sophus_LIBRARIES Sophus::Sophus)
++endif()
++if(TARGET Sophus::Sophus)
++  get_target_property(Sophus_INCLUDE_DIRS Sophus::Sophus INTERFACE_INCLUDE_DIRECTORIES)
++endif()
+ 
+ # Include dirs
+ INCLUDE_DIRECTORIES(

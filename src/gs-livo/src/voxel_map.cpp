@@ -12,6 +12,64 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace
+{
+bool isFinitePointWithVar(const pointWithVar &pv)
+{
+  return pv.point_b.allFinite() &&
+         pv.point_w.allFinite() &&
+         pv.body_var.allFinite() &&
+         pv.var.allFinite() &&
+         pv.point_crossmat.allFinite();
+}
+
+bool isUsablePlaneForResidual(const VoxelPlane &plane)
+{
+  return plane.is_plane_ &&
+         plane.center_.allFinite() &&
+         plane.normal_.allFinite() &&
+         plane.x_normal_.allFinite() &&
+         plane.y_normal_.allFinite() &&
+         plane.covariance_.allFinite() &&
+         plane.plane_var_.allFinite() &&
+         std::isfinite(plane.radius_) &&
+         std::isfinite(plane.min_eigen_value_) &&
+         std::isfinite(plane.mid_eigen_value_) &&
+         std::isfinite(plane.max_eigen_value_) &&
+         std::isfinite(plane.d_) &&
+         plane.radius_ >= 0.0f &&
+         plane.min_eigen_value_ >= 0.0f &&
+         plane.mid_eigen_value_ >= 0.0f &&
+         plane.max_eigen_value_ >= 0.0f;
+}
+
+bool getVoxelLocation(const Eigen::Vector3d &point_w, const float voxel_size, VOXEL_LOCATION &position)
+{
+  if (!point_w.allFinite() || !std::isfinite(voxel_size) || voxel_size <= 0.0f) return false;
+
+  int64_t loc_xyz[3];
+  for (int j = 0; j < 3; j++)
+  {
+    double loc = point_w[j] / voxel_size;
+    if (!std::isfinite(loc)) return false;
+    if (loc < 0) loc -= 1.0;
+    if (loc < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
+        loc > static_cast<double>(std::numeric_limits<int64_t>::max()))
+    {
+      return false;
+    }
+    loc_xyz[j] = static_cast<int64_t>(loc);
+  }
+
+  position = VOXEL_LOCATION(loc_xyz[0], loc_xyz[1], loc_xyz[2]);
+  return true;
+}
+} // namespace
+
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
   if (pb[2] == 0) pb[2] = 0.0001;
@@ -46,6 +104,7 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<vector<int>>("lio/layer_init_num", voxel_config.layer_init_num_, vector<int>{5,5,5,5,5});
   nh.param<int>("lio/max_points_num", voxel_config.max_points_num_, 50);
   nh.param<int>("lio/max_iterations", voxel_config.max_iterations_, 5);
+  nh.param<int>("lio/min_effective_features", voxel_config.min_effective_features_, 10);
 
   nh.param<bool>("local_map/map_sliding_en", voxel_config.map_sliding_en, false);
   nh.param<int>("local_map/half_map_size", voxel_config.half_map_size, 100);
@@ -58,20 +117,43 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
   plane->covariance_ = Eigen::Matrix3d::Zero();
   plane->center_ = Eigen::Vector3d::Zero();
   plane->normal_ = Eigen::Vector3d::Zero();
+  plane->x_normal_ = Eigen::Vector3d::Zero();
+  plane->y_normal_ = Eigen::Vector3d::Zero();
   plane->points_size_ = points.size();
   plane->radius_ = 0;
+  plane->is_plane_ = false;
+  plane->is_update_ = false;
+  if (points.empty()) return;
+
   for (auto pv : points)
   {
+    if (!isFinitePointWithVar(pv))
+    {
+      plane->is_update_ = true;
+      return;
+    }
     plane->covariance_ += pv.point_w * pv.point_w.transpose();
     plane->center_ += pv.point_w;
   }
   plane->center_ = plane->center_ / plane->points_size_;
   plane->covariance_ = plane->covariance_ / plane->points_size_ - plane->center_ * plane->center_.transpose();
+  if (!plane->center_.allFinite() || !plane->covariance_.allFinite())
+  {
+    plane->is_update_ = true;
+    return;
+  }
+
   Eigen::EigenSolver<Eigen::Matrix3d> es(plane->covariance_);
   Eigen::Matrix3cd evecs = es.eigenvectors();
   Eigen::Vector3cd evals = es.eigenvalues();
   Eigen::Vector3d evalsReal;
   evalsReal = evals.real();
+  if (!evecs.real().allFinite() || !evalsReal.allFinite())
+  {
+    plane->is_update_ = true;
+    return;
+  }
+
   Eigen::Matrix3f::Index evalsMin, evalsMax;
   evalsReal.rowwise().sum().minCoeff(&evalsMin);
   evalsReal.rowwise().sum().maxCoeff(&evalsMax);
@@ -120,6 +202,11 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
     plane->d_ = -(plane->normal_(0) * plane->center_(0) + plane->normal_(1) * plane->center_(1) + plane->normal_(2) * plane->center_(2));
     plane->is_plane_ = true;
     plane->is_update_ = true;
+    if (!isUsablePlaneForResidual(*plane))
+    {
+      plane->is_plane_ = false;
+      return;
+    }
     if (!plane->is_init_)
     {
       plane->id_ = voxel_plane_id;
@@ -337,6 +424,8 @@ VoxelOctoTree *VoxelOctoTree::Insert(const pointWithVar &pv)
 
 void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 {
+  last_update_success_ = false;
+  const StatesGroup state_at_entry = state_;
   cross_mat_list_.clear();
   cross_mat_list_.reserve(feats_down_size_);
   body_cov_list_.clear();
@@ -401,8 +490,23 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       total_residual += fabs(ptpl_list_[i].dis_to_plane_);
     }
     effct_feat_num_ = ptpl_list_.size();
+    if (effct_feat_num_ < config_setting_.min_effective_features_)
+    {
+      cout << "[ LIO ] update skip: effective feature num " << effct_feat_num_
+           << " < min_effective_features " << config_setting_.min_effective_features_ << endl;
+      state_ = state_at_entry;
+      return;
+    }
+
+    const double mean_residual = total_residual / effct_feat_num_;
+    if (!std::isfinite(mean_residual))
+    {
+      cout << "[ LIO ] update skip: non-finite average residual" << endl;
+      state_ = state_at_entry;
+      return;
+    }
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
-         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / effct_feat_num_ << endl;
+         << " effective feature num: " << effct_feat_num_ << " average residual: " << mean_residual << endl;
 
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
@@ -411,6 +515,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     VectorXd R_inv(effct_feat_num_);
     VectorXd meas_vec(effct_feat_num_);
     meas_vec.setZero();
+    bool valid_measurement_model = true;
     for (int i = 0; i < effct_feat_num_; i++)
     {
       auto &ptpl = ptpl_list_[i];
@@ -445,16 +550,44 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       var = state_propagat.rot_end * extR_ * ptpl_list_[i].body_cov_ * (state_propagat.rot_end * extR_).transpose();
 
       double sigma_l = J_nq * ptpl_list_[i].plane_var_ * J_nq.transpose();
+      const double point_var = ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_;
+      const double meas_var = 0.001 + sigma_l + point_var;
+      if (!point_this.allFinite() ||
+          !point_world.allFinite() ||
+          !J_nq.allFinite() ||
+          !var.allFinite() ||
+          !ptpl_list_[i].plane_var_.allFinite() ||
+          !ptpl_list_[i].normal_.allFinite() ||
+          !std::isfinite(ptpl_list_[i].dis_to_plane_) ||
+          !std::isfinite(sigma_l) ||
+          !std::isfinite(point_var) ||
+          !std::isfinite(meas_var) ||
+          meas_var <= 1e-12)
+      {
+        valid_measurement_model = false;
+        break;
+      }
 
-      R_inv(i) = 1.0 / (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
+      R_inv(i) = 1.0 / meas_var;
       // R_inv(i) = 1.0 / (sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
 
       /*** calculate the Measuremnt Jacobian matrix H ***/
       V3D A(point_crossmat * state_.rot_end.transpose() * ptpl_list_[i].normal_);
+      if (!A.allFinite() || !std::isfinite(R_inv(i)))
+      {
+        valid_measurement_model = false;
+        break;
+      }
       Hsub.row(i) << VEC_FROM_ARRAY(A), ptpl_list_[i].normal_[0], ptpl_list_[i].normal_[1], ptpl_list_[i].normal_[2];
       Hsub_T_R_inv.col(i) << A[0] * R_inv(i), A[1] * R_inv(i), A[2] * R_inv(i), ptpl_list_[i].normal_[0] * R_inv(i),
           ptpl_list_[i].normal_[1] * R_inv(i), ptpl_list_[i].normal_[2] * R_inv(i);
       meas_vec(i) = -ptpl_list_[i].dis_to_plane_;
+    }
+    if (!valid_measurement_model || !Hsub.allFinite() || !Hsub_T_R_inv.allFinite() || !meas_vec.allFinite())
+    {
+      cout << "[ LIO ] update abort: invalid measurement model" << endl;
+      state_ = state_at_entry;
+      return;
     }
     EKF_stop_flg = false;
     flg_EKF_converged = false;
@@ -464,14 +597,51 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto &&HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
+    if (!HTz.allFinite() || !H_T_H.allFinite())
+    {
+      cout << "[ LIO ] update abort: non-finite normal equation" << endl;
+      state_ = state_at_entry;
+      return;
+    }
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
+    if (!K_1.allFinite())
+    {
+      cout << "[ LIO ] update abort: non-finite Kalman matrix" << endl;
+      state_ = state_at_entry;
+      return;
+    }
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
+    if (!G.allFinite())
+    {
+      cout << "[ LIO ] update abort: non-finite Kalman gain" << endl;
+      state_ = state_at_entry;
+      return;
+    }
     auto vec = state_propagat - state_;
     VD(DIM_STATE)
     solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+    if (!solution.allFinite())
+    {
+      cout << "[ LIO ] update abort: non-finite solution" << endl;
+      state_ = state_at_entry;
+      return;
+    }
     int minRow, minCol;
     state_ += solution;
+    const bool finite_state = state_.rot_end.allFinite() &&
+                              state_.pos_end.allFinite() &&
+                              state_.vel_end.allFinite() &&
+                              state_.bias_g.allFinite() &&
+                              state_.bias_a.allFinite() &&
+                              state_.gravity.allFinite() &&
+                              std::isfinite(state_.inv_expo_time);
+    if (!finite_state)
+    {
+      cout << "[ LIO ] update abort: non-finite state" << endl;
+      state_ = state_at_entry;
+      return;
+    }
     auto rot_add = solution.block<3, 1>(0, 0);
     auto t_add = solution.block<3, 1>(3, 0);
     if ((rot_add.norm() * 57.3 < 0.01) && (t_add.norm() * 100 < 0.015)) { flg_EKF_converged = true; }
@@ -488,12 +658,19 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       // _state.cov = (I_STATE - G) * _state.cov;
       state_.cov.block<DIM_STATE, DIM_STATE>(0, 0) =
           (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) * state_.cov.block<DIM_STATE, DIM_STATE>(0, 0);
+      if (!state_.cov.allFinite())
+      {
+        cout << "[ LIO ] update abort: non-finite covariance" << endl;
+        state_ = state_at_entry;
+        return;
+      }
       // total_distance += (_state.pos_end - position_last).norm();
       position_last_ = state_.pos_end;
       geoQuat_ = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
 
       // VD(DIM_STATE) K_sum  = K.rowwise().sum();
       // VD(DIM_STATE) P_diag = _state.cov.diagonal();
+      last_update_success_ = true;
       EKF_stop_flg = true;
     }
     if (EKF_stop_flg) break;
@@ -537,34 +714,65 @@ void VoxelMapManager::BuildVoxelMap()
   int max_points_num = config_setting_.max_points_num_;
   std::vector<int> layer_init_num = config_setting_.layer_init_num_;
 
+  vector<pointWithVar>().swap(pv_list_);
+
+  if (!std::isfinite(voxel_size) || voxel_size <= 0.0f)
+  {
+    cout << "[ LIO ] bootstrap skip: invalid voxel size" << endl;
+    return;
+  }
+  if (layer_init_num.empty())
+  {
+    cout << "[ LIO ] bootstrap skip: empty layer_init_num" << endl;
+    return;
+  }
+  if (feats_down_world_ == nullptr || feats_down_body_ == nullptr ||
+      feats_down_world_->size() != feats_down_body_->size())
+  {
+    cout << "[ LIO ] bootstrap skip: invalid downsampled cloud pointers or size mismatch" << endl;
+    return;
+  }
+
   std::vector<pointWithVar> input_points;
+  input_points.reserve(feats_down_world_->size());
 
   for (size_t i = 0; i < feats_down_world_->size(); i++)
   {
     pointWithVar pv;
     pv.point_w << feats_down_world_->points[i].x, feats_down_world_->points[i].y, feats_down_world_->points[i].z;
+    pv.point_b << feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z;
+    if (!pv.point_w.allFinite() || !pv.point_b.allFinite()) continue;
+
     V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
     M3D var;
     calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
+    if (!var.allFinite()) continue;
+    pv.body_var = var;
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(point_this);
+    pv.point_crossmat = point_crossmat;
     var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +
           (-point_crossmat) * state_.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + state_.cov.block<3, 3>(3, 3);
     pv.var = var;
+    if (!isFinitePointWithVar(pv)) continue;
     input_points.push_back(pv);
   }
 
   uint plsize = input_points.size();
+  if (plsize == 0)
+  {
+    cout << "[ LIO ] bootstrap skip: no finite point-with-variance" << endl;
+    return;
+  }
+
+  std::vector<pointWithVar> inserted_points;
+  inserted_points.reserve(input_points.size());
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = p_v.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    VOXEL_LOCATION position;
+    if (!getVoxelLocation(p_v.point_w, voxel_size, position)) continue;
+    inserted_points.push_back(p_v);
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
@@ -583,6 +791,12 @@ void VoxelMapManager::BuildVoxelMap()
       voxel_map_[position]->new_points_++;
       voxel_map_[position]->layer_init_num_ = layer_init_num;
     }
+  }
+  pv_list_ = inserted_points;
+  if (pv_list_.empty())
+  {
+    cout << "[ LIO ] bootstrap skip: no finite indexed point" << endl;
+    return;
   }
   for (auto iter = voxel_map_.begin(); iter != voxel_map_.end(); ++iter)
   {
@@ -613,17 +827,18 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   int max_layer = config_setting_.max_layer_;
   int max_points_num = config_setting_.max_points_num_;
   std::vector<int> layer_init_num = config_setting_.layer_init_num_;
+  if (!std::isfinite(voxel_size) || voxel_size <= 0.0f || layer_init_num.empty())
+  {
+    cout << "[ LIO ] voxel map update skip: invalid voxel configuration" << endl;
+    return;
+  }
   uint plsize = input_points.size();
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = p_v.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    if (!isFinitePointWithVar(p_v)) continue;
+    VOXEL_LOCATION position;
+    if (!getVoxelLocation(p_v.point_w, voxel_size, position)) continue;
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
     else
@@ -662,13 +877,9 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   for (int i = 0; i < index.size(); i++)
   {
     pointWithVar &pv = pv_list[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = pv.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    if (!isFinitePointWithVar(pv)) continue;
+    VOXEL_LOCATION position;
+    if (!getVoxelLocation(pv.point_w, voxel_size, position)) continue;
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
@@ -680,12 +891,12 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       if (!is_sucess)
       {
         VOXEL_LOCATION near_position = position;
-        if (loc_xyz[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_)) { near_position.x = near_position.x + 1; }
-        else if (loc_xyz[0] < (current_octo->voxel_center_[0] - current_octo->quater_length_)) { near_position.x = near_position.x - 1; }
-        if (loc_xyz[1] > (current_octo->voxel_center_[1] + current_octo->quater_length_)) { near_position.y = near_position.y + 1; }
-        else if (loc_xyz[1] < (current_octo->voxel_center_[1] - current_octo->quater_length_)) { near_position.y = near_position.y - 1; }
-        if (loc_xyz[2] > (current_octo->voxel_center_[2] + current_octo->quater_length_)) { near_position.z = near_position.z + 1; }
-        else if (loc_xyz[2] < (current_octo->voxel_center_[2] - current_octo->quater_length_)) { near_position.z = near_position.z - 1; }
+        if (pv.point_w[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_)) { near_position.x = near_position.x + 1; }
+        else if (pv.point_w[0] < (current_octo->voxel_center_[0] - current_octo->quater_length_)) { near_position.x = near_position.x - 1; }
+        if (pv.point_w[1] > (current_octo->voxel_center_[1] + current_octo->quater_length_)) { near_position.y = near_position.y + 1; }
+        else if (pv.point_w[1] < (current_octo->voxel_center_[1] - current_octo->quater_length_)) { near_position.y = near_position.y - 1; }
+        if (pv.point_w[2] > (current_octo->voxel_center_[2] + current_octo->quater_length_)) { near_position.z = near_position.z + 1; }
+        else if (pv.point_w[2] < (current_octo->voxel_center_[2] - current_octo->quater_length_)) { near_position.z = near_position.z - 1; }
         auto iter_near = voxel_map_.find(near_position);
         if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, prob, single_ptpl); }
       }
@@ -718,14 +929,25 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
 
   double radius_k = 3;
   Eigen::Vector3d p_w = pv.point_w;
-  if (current_octo->plane_ptr_->is_plane_)
+  if (isUsablePlaneForResidual(*current_octo->plane_ptr_))
   {
     VoxelPlane &plane = *current_octo->plane_ptr_;
     Eigen::Vector3d p_world_to_center = p_w - plane.center_;
-    float dis_to_plane = fabs(plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_);
-    float dis_to_center = (plane.center_(0) - p_w(0)) * (plane.center_(0) - p_w(0)) + (plane.center_(1) - p_w(1)) * (plane.center_(1) - p_w(1)) +
-                          (plane.center_(2) - p_w(2)) * (plane.center_(2) - p_w(2));
-    float range_dis = sqrt(dis_to_center - dis_to_plane * dis_to_plane);
+    const double signed_dis_to_plane = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+    const double dis_to_plane = fabs(signed_dis_to_plane);
+    const double dis_to_center = (plane.center_(0) - p_w(0)) * (plane.center_(0) - p_w(0)) +
+                                 (plane.center_(1) - p_w(1)) * (plane.center_(1) - p_w(1)) +
+                                 (plane.center_(2) - p_w(2)) * (plane.center_(2) - p_w(2));
+    const double range_sq = dis_to_center - dis_to_plane * dis_to_plane;
+    if (!p_world_to_center.allFinite() ||
+        !std::isfinite(signed_dis_to_plane) ||
+        !std::isfinite(dis_to_center) ||
+        !std::isfinite(range_sq) ||
+        range_sq < -1e-9)
+    {
+      return;
+    }
+    const double range_dis = sqrt(std::max(0.0, range_sq));
 
     if (range_dis <= radius_k * plane.radius_)
     {
@@ -734,10 +956,20 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
       J_nq.block<1, 3>(0, 3) = -plane.normal_;
       double sigma_l = J_nq * plane.plane_var_ * J_nq.transpose();
       sigma_l += plane.normal_.transpose() * pv.var * plane.normal_;
-      if (dis_to_plane < sigma_num * sqrt(sigma_l))
+      if (!J_nq.allFinite() || !std::isfinite(sigma_l) || sigma_l <= 1e-12)
+      {
+        return;
+      }
+      const double sigma = sqrt(sigma_l);
+      if (!std::isfinite(sigma) || sigma <= 0.0)
+      {
+        return;
+      }
+      if (dis_to_plane < sigma_num * sigma)
       {
         is_sucess = true;
-        double this_prob = 1.0 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
+        double this_prob = 1.0 / sigma * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
+        if (!std::isfinite(this_prob)) return;
         if (this_prob > prob)
         {
           prob = this_prob;
@@ -750,7 +982,7 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
           single_ptpl.center_ = plane.center_;
           single_ptpl.d_ = plane.d_;
           single_ptpl.layer_ = current_layer;
-          single_ptpl.dis_to_plane_ = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+          single_ptpl.dis_to_plane_ = signed_dis_to_plane;
         }
         return;
       }

@@ -20,6 +20,9 @@ which is included as part of this source code package.
 #include "feature.h"
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
+#include <array>
+#include <filesystem>
+#include <memory>
 #include <set>
 #include <vikit/math_utils.h>
 #include <vikit/robust_cost.h>
@@ -119,6 +122,7 @@ public:
   deque<vector<pointWithVar> > buffer_pg;
   unordered_map<VOXEL_LOCATION, VOXEL_GS_POINTS *> gs_map;
   std::vector<GS_point > sub_GSMap;
+  std::vector<GS_point *> sub_GSMap_ptrs;
 
 
 
@@ -144,6 +148,7 @@ public:
 
   cv::Mat img_undistort;
   cv::Mat img_rendered;
+  std::vector<std::unique_ptr<VisualPoint>> gs_measurement_points;
 
   int grid_size;
   vk::AbstractCamera *cam;
@@ -153,10 +158,45 @@ public:
   M3D Rli, Rci, Rcl, Rcw, Jdphi_dR, Jdp_dt, Jdp_dR;
   V3D Pli, Pci, Pcl, Pcw;
 
-  double scale_factor,scale_factor2,normal_rejecter;
-  int save_GS_iter;
-  double root_voxel_size;
-  int octree_max_level;
+  double scale_factor = 0.0, scale_factor2 = 0.0, normal_rejecter = 0.0;
+  int save_GS_iter = 0;
+  double root_voxel_size = 0.5;
+  double gs_voxel_size = 1.0;
+  int octree_max_level = 3;
+  bool gs_white_background = false;
+  bool gs_save_results = true;
+  bool gs_save_rendered_images = true;
+  bool gs_save_gt_images = true;
+  bool gs_sparse_vio_fallback_en = true;
+  bool gs_pose_update_en = false;
+  bool gs_render_jacobian_en = true;
+  bool gs_pose_finite_diff_jacobian_en = false;
+  bool gs_pose_update_exposure_en = false;
+  double gs_pose_fd_rot_eps = 1e-4;
+  double gs_pose_fd_trans_eps = 1e-3;
+  int gs_pose_fd_max_gaussians = 3000;
+  int gs_max_insert_gaussians = 3000;
+  int gs_max_points_per_voxel = 300;
+  int gs_pose_update_start_frame = 80;
+  int gs_pose_update_min_gaussians = 5000;
+  int gs_pose_update_min_points = 120;
+  int gs_pose_update_min_measurements = 1500;
+  double gs_pose_update_max_rmse = 35.0;
+  double gs_pose_update_step_damping = 0.5;
+  double gs_pose_update_max_raw_rot_deg = 1.0;
+  double gs_pose_update_max_raw_trans = 0.1;
+  double gs_max_pose_update_rot_deg = 0.2;
+  double gs_max_pose_update_trans = 0.02;
+  int gs_active_voxel_radius = 1;
+  int gs_max_seed_voxels = 2000;
+  int gs_max_active_voxels = 3000;
+  int gs_max_map_voxels = 8000;
+  int gs_max_total_gaussians = 1200000;
+  int gs_prune_interval_frames = 10;
+  int gs_frame_count = 0;
+  int gs_last_update_measurements = 0;
+  double gs_last_update_rmse = 0.0;
+  std::string gs_output_dir;
 
 
   int64 gs_total=0;
@@ -178,7 +218,14 @@ public:
   int patch_pyrimid_level, patch_size, patch_size_total, patch_size_half, border, warp_len;
   int max_iterations, total_points;
 
-  double img_point_cov, outlier_threshold, outlier_threshold2,outlier_threshold3, ncc_thre;
+  double img_point_cov = 100.0;
+  double outlier_threshold = 1000.0;
+  double vio_max_update_rot_deg = 5.0;
+  double vio_max_update_trans = 0.5;
+  double vio_max_update_vel = 10.0;
+  double outlier_threshold2 = 100.0;
+  double outlier_threshold3 = 100.0;
+  double ncc_thre = 0.0;
   
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
@@ -214,21 +261,30 @@ public:
   ~VIOManager();
   void updateStateInverse(cv::Mat img, int level);
   void updateState(cv::Mat img, int level);
-  void updateState_gs(cv::Mat img, cv::Mat img_render, int level);
+  bool updateState_gs(cv::Mat img, cv::Mat img_render, int level);
   void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
   void processFrameGS(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void retrieveFrom_GS_Map2(vector<pointWithVar> &pg);
   
   void insertPointInto_GS_Map2(const std::vector<pointWithVar>& pg);
+  void pruneGSMapIfNeeded();
   cv::Mat tensor_to_mat4(torch::Tensor tensor);
+  void updateGSCameraPoseFromState(const StatesGroup &render_state);
+  cv::Mat renderGSImageAtState(const StatesGroup &render_state);
+  std::filesystem::path resolveGSOutputDir() const;
+  std::vector<GS_point> collectGSMapSnapshot();
+  void writeBackOptimizedSubGSMap();
+  void writeGSPointPly(const std::filesystem::path &file_path, const std::vector<GS_point> &points) const;
+  void saveGSResults(int frame_id, double img_time);
+  void prepareGSPhotometricMeasurements(const cv::Mat &img, const cv::Mat &img_rendered, const vector<pointWithVar> &pg);
   void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
   void setLidarToCameraExtrinsic(vector<double> &R, vector<double> &P);
   void initializeVIO();
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);
   void computeProjectionJacobian(V3D p, MD(2, 3) & J);
-  void computeJacobianAndUpdateEKF(cv::Mat img);
+  bool computeJacobianAndUpdateEKF(cv::Mat img);
   void computeJacobianAndUpdateEKF_GS(cv::Mat img,cv::Mat img_rendered);
   void resetGrid();
 
@@ -249,7 +305,7 @@ public:
   void dumpDataForColmap();
   double calculateNCC(float *ref_patch, float *cur_patch, int patch_size);
   int getBestSearchLevel(const Matrix2d &A_cur_ref, const int max_level);
-  V3F getInterpolatedPixel(cv::Mat img, V2D pc);
+  V3F getInterpolatedPixel(const cv::Mat &img, V2D pc);
   
   // void resetRvizDisplay();
   // deque<VisualPoint *> map_cur_frame;
