@@ -1,107 +1,181 @@
+# GS-LIVO 安装与配置
 
-# GS-LIVO DemoPage
-Project Page: [gs-livo.tech](https://gs-livo.tech) (coming soon)
+Ubuntu 20.04 + ROS Noetic + CUDA 环境下配置、编译和运行 GS-LIVO 
 
-This repository shows the experimental results of our GS-LIVO system running on various public datasets and real-world scenarios.
+## 1. 已验证环境
 
-安装、依赖配置和本机验证记录见 [INSTALL.md](./INSTALL.md)。
-算法流程和当前 GS 使用状态说明见 [ALGORITHM_LOGIC.md](./ALGORITHM_LOGIC.md)。
+- Ubuntu 20.04.6 LTS
+- ROS Noetic
+- CMake 3.24.4
+- CUDA 12.8
+- PyTorch/libtorch 2.8.0 + CUDA 12.8
+- Sophus non-templated/double-only 版本，安装位置为 `/usr/local/lib/libSophus.so`
+- Livox ROS Driver workspace：`/home/lurvelly/Workspace/Livox-ROS-Driver/devel`
 
-## System Overview and Principles
+## 2. 系统依赖
 
-GS-LIVO (Gaussian Splatting LiDAR-Inertial-Visual Odometry) is a novel SLAM framework that seamlessly integrates LiDAR, inertial, and visual sensors. The system comprises four key modules:
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential git cmake python3-dev python3-pip \
+  ros-noetic-desktop-full \
+  ros-noetic-cv-bridge ros-noetic-image-transport \
+  ros-noetic-pcl-ros ros-noetic-eigen-conversions \
+  libopencv-dev libpcl-dev libeigen3-dev libboost-all-dev \
+  libtbb-dev libyaml-cpp-dev
+```
 
-<img src="./pdf/Overview.png" width="100%" />
+如果 ROS 已安装，只需要补齐缺失的 `ros-noetic-*` 和 C++ 依赖即可。
 
-1. **Global Gaussian Map**: A spatial hash-indexed octree structure that efficiently covers sparse spatial volumes while adapting to various environmental details and scales. This structure enables effective management of large-scale environments with minimal memory overhead.
+## 3. Sophus
 
-2. **Gaussian Initialization and Optimization**: The system performs rapid initialization of Gaussians using both LiDAR and visual information, followed by online optimization using photometric gradients. This dual-sensor approach ensures robust and accurate scene representation.
+本项目使用 FAST-LIVO2/vikit 依赖的旧版 Sophus API，例如 `Sophus::SE3`。不要使用只有 `Sophus::SE3d`/模板 API 的新版 header-only Sophus。
 
-<img src="./pdf/iGM.png" width="100%" />
+```bash
+git clone https://github.com/strasdat/Sophus.git
+cd Sophus
+git checkout a621ff
+mkdir -p build
+cd build
+cmake ..
+make -j$(nproc)
+sudo make install
+sudo ldconfig
+```
 
-3. **Sliding Window Management**: To maintain real-time performance, GS-LIVO employs an innovative sliding window approach for Gaussian maintenance. This includes:
-   - Efficient memory management between CPU and GPU
-   - Incremental updates to avoid redundant computations
-   - Strategic handling of Gaussians entering and leaving the field of view
+检查：
 
-4. **State Estimation**: The system utilizes an Iterated Extended Kalman Filter (IESKF) with sequential updates, tightly integrating LiDAR and image measurements. Unlike traditional patch-based methods, GS-LIVO achieves seamless rendering with high visual quality.
+```bash
+test -f /usr/local/lib/libSophus.so
+test -f /usr/local/include/sophus/se3.h
+```
 
-Key advantages of our approach include:
-- Seamless integration of multiple sensor modalities
-- Efficient memory management through sliding window optimization
-- High-quality scene representation using Gaussian splatting
-- Real-time performance on both high-end GPUs and edge computing devices
+## 4. Torch/libtorch
 
----
+任选一种方式提供 Torch CMake 包。
 
----
+方式 A：使用已有 Python torch：
 
-## Hardware & Platform Clarification
-- **Car Platform & Handheld Platform**: Tested on **Jetson Orin NX (16GB)**
+```bash
+python3 - <<'PY'
+import torch
+print(torch.__version__)
+print(torch.version.cuda)
+print(torch.utils.cmake_prefix_path)
+PY
+```
 
-<img src="./gif/device.gif" width="100%" />
+编译时把 `Torch_DIR` 指向输出路径下的 `Torch` 目录，例如本机验证用：
 
-- **Other Datasets (MARS-LVIG, Landmark, UAV, HKU)**: Tested on a **PC with NVIDIA RTX 4090**
+```bash
+export Torch_DIR=/home/lurvelly/miniconda3/envs/yolo/lib/python3.10/site-packages/torch/share/cmake/Torch
+```
 
----
+方式 B：下载官方 libtorch，并设置：
 
-## Results on MARS-LVIG Dataset
-> *These results were produced on PC with NVIDIA RTX 4090.*
+```bash
+export Torch_DIR=/path/to/libtorch/share/cmake/Torch
+```
 
-### SLAM Process
-<img src="./gif/lvig1.gif" width="100%" />
+Torch 的 CUDA 版本应与系统 CUDA 主版本兼容。本机使用 CUDA 12.8 + torch 2.8.0 cu128。
 
-### SLAM Output Results
-<img src="./gif/lvig2.gif" width="100%" />
+## 5. Livox ROS Driver
 
----
+先编译 Livox ROS Driver，并让 GS-LIVO overlay 它：
 
-## Results on Landmark Dataset
-> *These results were produced on PC with NVIDIA RTX 4090.*
+```bash
+cd /home/lurvelly/Workspace/Livox-ROS-Driver
+catkin_make
+source devel/setup.zsh
+```
 
-### SLAM Process
-<img src="./gif/SJTU1.gif" width="100%" />
+新机器上路径不同的话，后续 `CMAKE_PREFIX_PATH` 中替换为你的 Livox workspace `devel` 路径。
 
-### SLAM Output Results
-<img src="./gif/SJTU2.gif" width="100%" />
+## 6. rpg_vikit
 
----
+`src/rpg_vikit` 是本项目需要的 catkin 依赖。当前仓库把它记录为 submodule。重新克隆后先初始化它，再应用本仓库提供的适配 patch：
 
-## Results on UAV Playground Dataset
-> *These results were produced on PC with NVIDIA RTX 4090.*
+```bash
+cd /home/lurvelly/Workspace/GS-LIVO
+git submodule update --init src/rpg_vikit
+git -C src/rpg_vikit apply ../../patches/rpg_vikit_gs_livo.patch
+```
 
-### SLAM Process
-<img src="./gif/UAV_1.gif" width="100%" />
+本项目的 CMake 已对 vikit 做了两点适配：
 
-### SLAM Output Results
-<img src="./gif/UAV2.gif" width="100%" />
+- 显式链接 `/usr/local/lib/libSophus.so`
+- 默认关闭 vikit 测试可执行文件，只构建 `vikit_common` 和 `vikit_ros`
 
----
+## 7. 编译 GS-LIVO
 
-## Results on FAST-LIVO HKU Dataset
-> *These results were produced on PC with NVIDIA RTX 4090.*
+在仓库根目录执行：
 
-### SLAM Process
-<!-- HKU1 原始大小 100%，不做缩放 -->
-<img src="./gif/HKU1.gif" width="100%" />
+```bash
+cd /home/lurvelly/Workspace/GS-LIVO
+source /opt/ros/noetic/setup.zsh
 
-### SLAM Output Results
-<img src="./gif/HKU2.gif" width="100%" />
+export Torch_DIR=/home/lurvelly/miniconda3/envs/yolo/lib/python3.10/site-packages/torch/share/cmake/Torch
+export TORCH_CUDA_ARCH_LIST=8.9
+export CMAKE_PREFIX_PATH=/home/lurvelly/Workspace/Livox-ROS-Driver/devel:/opt/ros/noetic
 
----
+catkin_make -j4 -DTorch_DIR=$Torch_DIR
+```
 
-## Vehicle Implementation
-> *Tested on Jetson Orin NX (16GB).*
+`TORCH_CUDA_ARCH_LIST` 需要按 GPU 调整：
 
-Implementation of GS-LIVO on a real vehicle with A* LQR path planning:
+- RTX 4090：`8.9`
+- RTX 30 系列：`8.6`
+- Jetson Orin：`8.7`
 
-<img src="./gif/car.gif" width="100%" />
+编译成功后应生成：
 
----
+```bash
+devel/lib/fast_livo/fastlivo_mapping
+devel/lib/lib3dgs_lib.so
+devel/lib/libvikit_common.so
+devel/lib/libvikit_ros.so
+```
 
-## Edge Computing Deployment
-> *Tested on Jetson Orin NX (16GB).*
+## 8. 验证
 
-Real-time deployment on Jetson Orin NX 16GB:
+```bash
+source devel/setup.zsh
+rospack find fast_livo
+roslaunch --files fast_livo mapping_avia.launch
+roslaunch --nodes fast_livo mapping_avia.launch
+ldd devel/lib/fast_livo/fastlivo_mapping | grep 'not found' || true
+```
 
-<img src="./gif/handhold.gif" width="100%" />
+本机验证结果：
+
+- `catkin_make -j4 ...` 成功，`fastlivo_mapping` 构建到 100%
+- `rospack find fast_livo` 返回 `src/gs-livo`
+- `roslaunch --files fast_livo mapping_avia.launch` 能找到 launch 文件
+- `roslaunch --nodes fast_livo mapping_avia.launch` 返回 `/laserMapping`、`/rviz`、`/republish`
+- `ldd` 未发现 `not found`
+
+直接 `rosrun fast_livo fastlivo_mapping` 或 `roslaunch` 需要 ROS master/socket 权限；在当前沙箱中网络 socket 被禁用，因此未做在线运行验证。
+
+## 9. 运行
+
+```bash
+cd /home/lurvelly/Workspace/GS-LIVO
+source devel/setup.zsh
+roslaunch fast_livo mapping_avia.launch
+```
+
+如果不需要 RViz：
+
+```bash
+roslaunch fast_livo mapping_avia.launch rviz:=false
+```
+
+默认话题在 `src/gs-livo/config/avia.yaml`：
+
+- Image: `/left_camera/image`
+- LiDAR: `/livox/lidar`
+- IMU: `/livox/imu`
+
+使用自己的 rosbag 或设备时，需要同步修改 `avia.yaml` 中的话题、外参、时间偏移和相机内参文件 `camera_pinhole.yaml`。
+
+
