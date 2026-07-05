@@ -101,11 +101,6 @@ git submodule update --init src/rpg_vikit
 git -C src/rpg_vikit apply ../../patches/rpg_vikit_gs_livo.patch
 ```
 
-本项目的 CMake 已对 vikit 做了两点适配：
-
-- 显式链接 `/usr/local/lib/libSophus.so`
-- 默认关闭 vikit 测试可执行文件，只构建 `vikit_common` 和 `vikit_ros`
-
 ## 7. 编译 GS-LIVO
 
 在仓库根目录执行：
@@ -146,16 +141,6 @@ roslaunch --nodes fast_livo mapping_avia.launch
 ldd devel/lib/fast_livo/fastlivo_mapping | grep 'not found' || true
 ```
 
-本机验证结果：
-
-- `catkin_make -j4 ...` 成功，`fastlivo_mapping` 构建到 100%
-- `rospack find fast_livo` 返回 `src/gs-livo`
-- `roslaunch --files fast_livo mapping_avia.launch` 能找到 launch 文件
-- `roslaunch --nodes fast_livo mapping_avia.launch` 返回 `/laserMapping`、`/rviz`、`/republish`
-- `ldd` 未发现 `not found`
-
-直接 `rosrun fast_livo fastlivo_mapping` 或 `roslaunch` 需要 ROS master/socket 权限；在当前沙箱中网络 socket 被禁用，因此未做在线运行验证。
-
 ## 9. 运行
 
 ```bash
@@ -168,6 +153,11 @@ roslaunch fast_livo mapping_avia.launch
 
 ```bash
 roslaunch fast_livo mapping_avia.launch rviz:=false
+```
+
+播放bag
+```bash
+rosbag play CBD_Building_01.bag
 ```
 
 默认话题在 `src/gs-livo/config/avia.yaml`：
