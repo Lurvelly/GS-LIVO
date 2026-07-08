@@ -590,9 +590,7 @@ void VIOManager::insertPointInto_GS_Map2(const std::vector<pointWithVar>& pg)
       auto voxel_iter = gsmap_manager->gs_map_.find(position);
       if (voxel_iter != gsmap_manager->gs_map_.end() && voxel_iter->second != nullptr)
       {
-        std::vector<GS_point*> existing_points;
-        voxel_iter->second->get_all_gs_points(existing_points);
-        count = existing_points.size();
+        count = voxel_iter->second->count_gs_points();
       }
     }
     voxel_point_counts[position] = count;
@@ -774,10 +772,12 @@ void VIOManager::pruneGSMapIfNeeded()
   {
     if (entry.second == nullptr) continue;
 
-    std::vector<GS_point *> voxel_points;
-    entry.second->get_all_gs_points(voxel_points);
-    const size_t point_count = voxel_points.size();
-    counted_points += static_cast<int64>(point_count);
+    size_t point_count = 0;
+    if (limit_points)
+    {
+      point_count = entry.second->count_gs_points();
+      counted_points += static_cast<int64>(point_count);
+    }
 
     const V3D voxel_center(
         (static_cast<double>(entry.first.x) + 0.5) * gs_voxel_size,
@@ -788,12 +788,23 @@ void VIOManager::pruneGSMapIfNeeded()
 
   if (candidates.empty()) return;
 
-  if (counted_points >= 0) gs_total = counted_points;
+  if (limit_points && counted_points >= 0) gs_total = counted_points;
 
-  std::sort(candidates.begin(), candidates.end(),
-            [](const PruneCandidate &lhs, const PruneCandidate &rhs) {
-              return lhs.distance2 > rhs.distance2;
-            });
+  const auto farther_first = [](const PruneCandidate &lhs, const PruneCandidate &rhs) {
+    return lhs.distance2 > rhs.distance2;
+  };
+  if (limit_voxels && !limit_points)
+  {
+    const size_t keep_remove_count = gsmap_manager->gs_map_.size() -
+        static_cast<size_t>(gs_max_map_voxels);
+    if (keep_remove_count < candidates.size())
+    {
+      std::nth_element(candidates.begin(), candidates.begin() + keep_remove_count,
+                       candidates.end(), farther_first);
+      candidates.resize(keep_remove_count);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), farther_first);
 
   const size_t voxel_count_before = gsmap_manager->gs_map_.size();
   const int64 gs_total_before = gs_total;
@@ -901,13 +912,16 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
       ranked_seeds.emplace_back((voxel_center - camera_center_w).squaredNorm(), position);
     }
 
+    const size_t keep_count = static_cast<size_t>(gs_max_seed_voxels);
+    std::nth_element(ranked_seeds.begin(), ranked_seeds.begin() + keep_count, ranked_seeds.end(),
+                     [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+    ranked_seeds.resize(keep_count);
     std::sort(ranked_seeds.begin(), ranked_seeds.end(),
               [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
 
     seed_voxel_list.clear();
     seed_voxel_list.reserve(static_cast<size_t>(gs_max_seed_voxels));
-    for (size_t i = 0; i < ranked_seeds.size() &&
-                       seed_voxel_list.size() < static_cast<size_t>(gs_max_seed_voxels); ++i)
+    for (size_t i = 0; i < ranked_seeds.size(); ++i)
     {
       seed_voxel_list.push_back(ranked_seeds[i].second);
     }
@@ -918,9 +932,11 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
   const size_t neighbor_span = static_cast<size_t>(2 * active_radius + 1);
   const size_t neighbor_count = neighbor_span * neighbor_span * neighbor_span;
   std::unordered_set<VOXEL_LOCATION> query_voxels;
-  query_voxels.reserve(std::min(
-      seed_voxel_list.size() * std::max<size_t>(neighbor_count, 1),
-      static_cast<size_t>(std::max(gs_max_active_voxels, 0)) + seed_voxel_list.size()));
+  const size_t query_reserve_target =
+      seed_voxel_list.size() * std::max<size_t>(neighbor_count, 1);
+  query_voxels.reserve(gs_max_active_voxels > 0
+      ? std::min(query_reserve_target, static_cast<size_t>(gs_max_active_voxels))
+      : query_reserve_target);
 
   for (const VOXEL_LOCATION &seed : seed_voxel_list)
   {
@@ -951,13 +967,16 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
       ranked_voxels.emplace_back((voxel_center - camera_center_w).squaredNorm(), position);
     }
 
+    const size_t keep_count = static_cast<size_t>(gs_max_active_voxels);
+    std::nth_element(ranked_voxels.begin(), ranked_voxels.begin() + keep_count, ranked_voxels.end(),
+                     [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+    ranked_voxels.resize(keep_count);
     std::sort(ranked_voxels.begin(), ranked_voxels.end(),
               [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
 
     query_voxels.clear();
     query_voxels.reserve(static_cast<size_t>(gs_max_active_voxels));
-    for (size_t i = 0; i < ranked_voxels.size() &&
-                       query_voxels.size() < static_cast<size_t>(gs_max_active_voxels); ++i)
+    for (size_t i = 0; i < ranked_voxels.size(); ++i)
     {
       query_voxels.insert(ranked_voxels[i].second);
     }
@@ -1027,13 +1046,6 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
     }
   }
 
-  for (auto &bin : image_bins)
-  {
-    std::sort(bin.begin(), bin.end(), [](const GSCandidate &lhs, const GSCandidate &rhs) {
-      return lhs.depth < rhs.depth;
-    });
-  }
-
   sub_GSMap.reserve(std::min(valid_candidates, max_render_gs));
   sub_GSMap_ptrs.reserve(std::min(valid_candidates, max_render_gs));
   if (valid_candidates <= max_render_gs)
@@ -1049,6 +1061,13 @@ void VIOManager::retrieveFrom_GS_Map2(vector<pointWithVar> &pg)
   }
   else
   {
+    for (auto &bin : image_bins)
+    {
+      std::sort(bin.begin(), bin.end(), [](const GSCandidate &lhs, const GSCandidate &rhs) {
+        return lhs.depth < rhs.depth;
+      });
+    }
+
     std::vector<size_t> bin_offsets(image_bins.size(), 0);
     while (sub_GSMap.size() < max_render_gs)
     {

@@ -90,6 +90,17 @@ public:
                     leaves_[i]->get_all_gs_points(all_points);
         }
     }
+  size_t count_gs_points() const
+  {
+    if (layer_ == max_layer_) return gs_points_.size();
+
+    size_t count = 0;
+    for (int i = 0; i < 8; i++)
+    {
+      if (leaves_[i] != nullptr) count += leaves_[i]->count_gs_points();
+    }
+    return count;
+  }
   void UpdateGSOctree(GS_point* pv)
   {
     // cout << "layer_: " << layer_ << endl;

@@ -2,8 +2,9 @@
 <!-- Launch file for Livox AVIA LiDAR -->
 
 	<arg name="rviz" default="true" />
+	<arg name="config_file" default="$(find fast_livo)/config/avia.yaml" />
 
-	<rosparam command="load" file="$(find fast_livo)/config/avia.yaml" />
+	<rosparam command="load" file="$(arg config_file)" />
 
 	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
 		<rosparam file="$(find fast_livo)/config/camera_pinhole.yaml" />

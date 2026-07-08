@@ -744,13 +744,24 @@ void LIVMapper::handleLIO()
       lio_update_accepted = false;
       std::cout << "[ LIO ] bootstrap rejected: non-finite propagated state" << std::endl;
     }
+    else if (feats_down_size < voxelmap_manager->config_setting_.min_effective_features_)
+    {
+      lio_update_accepted = false;
+      std::cout << "[ LIO ] bootstrap rejected: downsampled points=" << feats_down_size
+                << " < min_effective_features "
+                << voxelmap_manager->config_setting_.min_effective_features_ << std::endl;
+    }
     else
     {
       voxelmap_manager->BuildVoxelMap();
-      if (voxelmap_manager->pv_list_.empty())
+      if (static_cast<int>(voxelmap_manager->pv_list_.size()) <
+          voxelmap_manager->config_setting_.min_effective_features_)
       {
         lio_update_accepted = false;
-        std::cout << "[ LIO ] bootstrap rejected: no finite points for voxel map" << std::endl;
+        std::cout << "[ LIO ] bootstrap rejected: finite voxel map points="
+                  << voxelmap_manager->pv_list_.size()
+                  << " < min_effective_features "
+                  << voxelmap_manager->config_setting_.min_effective_features_ << std::endl;
       }
       else
       {
